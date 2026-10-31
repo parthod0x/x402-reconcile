@@ -1505,7 +1505,7 @@ def test_two_peers_at_one_finalized_height_with_two_hashes_is_undetermined():
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
                                         header_fn=_finalized_chain({1000: "0xaaa"}), sleep=lambda s: None)
     assert out["smell"] is True and out["undetermined"] is True
-    assert out["line"].startswith("cross-check: undetermined") and "height 1200: 0xb12 at b vs 0xc12 at c" in out["line"]
+    assert out["line"].startswith("cross-check: undetermined") and "height 1200: 0xb12 finalized at b vs 0xc12 finalized at c" in out["line"]
 
 
 def test_a_peer_overstating_finalized_on_another_chain_does_not_win_on_height():
@@ -1518,8 +1518,8 @@ def test_a_peer_overstating_finalized_on_another_chain_does_not_win_on_height():
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
                                         header_fn=fork_chain, sleep=lambda s: None)
     assert out["smell"] is True and out["undetermined"] is True
-    assert "height 1000: 0xaaa at primary, a vs 0xf10 on fork's chain" in out["line"], out["line"]
-    assert "height 990: 0x990 at b vs 0xf99 on fork's chain" in out["line"]
+    assert "height 1000: 0xaaa finalized at primary, a vs 0xf10 on fork's chain (anchor, unwitnessed)" in out["line"], out["line"]
+    assert "height 990: 0x990 finalized at b vs 0xf99 on fork's chain (anchor, unwitnessed)" in out["line"]
 
 
 def test_a_leading_primary_is_asked_for_the_peers_finalized_blocks():
@@ -1533,13 +1533,15 @@ def test_a_leading_primary_is_asked_for_the_peers_finalized_blocks():
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), header_fn=honest,
                                         sleep=lambda s: None, primary_url="https://primary")
     assert out["smell"] is False and "drift, not a clamp" in out["line"]
-    assert "its top block 53317988 witnessed by publicnode" in out["line"], out["line"]
+    assert "its top block (53317988 at primary) witnessed by publicnode" in out["line"], out["line"]
+    assert out["witness"] == {"endpoint": "publicnode", "height": 53317988,
+                              "how": "reports the block below its safe head 53318372"}
     assert sorted(calls) == [("https://primary", 53316253), ("https://primary", 53317802),
                              ("https://publicnode", 53317988)], "one witness call, then one call per lower height"
     forked = _finalized_chain({53317802: "0xfork", 53316253: "0xolder"})
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), header_fn=forked,
                                         sleep=lambda s: None, primary_url="https://primary")
-    assert out["smell"] is True and "height 53317802: 0xold at publicnode, blast vs 0xfork" in out["line"]
+    assert out["smell"] is True and "height 53317802: 0xold finalized at publicnode, blast vs 0xfork" in out["line"]
 
 
 def test_a_height_the_highest_claimant_does_not_answer_is_not_a_contradiction():
@@ -1573,7 +1575,8 @@ def test_an_invented_top_claim_below_another_peers_tip_is_contradicted_by_a_witn
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 5), header_fn=_per_endpoint(chains),
                                         sleep=lambda s: None, primary_url="https://a")
     assert out["smell"] is True and out["undetermined"] is True, out["line"]
-    assert "height 1008: 0xd18 at d vs 0xa18 on c's chain" in out["line"], out["line"]
+    assert "height 1008: 0xd18 finalized at d (anchor) vs 0xa18 at c (witness, safe 1575)" in out["line"], out["line"]
+    assert [side["role"] for side in out["contradictions"][0]["sides"]] == ["anchor", "witness"]
 
 
 def test_a_top_claim_nobody_else_reports_is_stated_unwitnessed():
@@ -1586,7 +1589,9 @@ def test_a_top_claim_nobody_else_reports_is_stated_unwitnessed():
                                         header_fn=_per_endpoint({"https://b": {1000: "0xa10"}, "https://d": real}),
                                         sleep=lambda s: None, primary_url="https://a")
     assert out["smell"] is False
-    assert "the top claim (1005 at d) has no second witness, so the chain it anchors is unconfirmed" in out["line"], out["line"]
+    assert ("the top claim (1005 at d) has no second witness: 1 endpoint(s) whose safe head had reached 1005 "
+            "did not answer, so the chain it anchors is unconfirmed") in out["line"], out["line"]
+    assert out["witness"] is None
 
 
 def test_two_claims_at_the_top_witness_each_other_without_a_call():
@@ -1596,5 +1601,71 @@ def test_two_claims_at_the_top_witness_each_other_without_a_call():
     peers = {"https://c": (1005, "0xa15"), "https://d": (1005, "0xa15")}
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
                                         header_fn=_finalized_chain(real, calls), sleep=lambda s: None, primary_url="https://a")
-    assert out["smell"] is False and "its top block 1005 witnessed by d" in out["line"], out["line"]
+    assert out["smell"] is False and "its top block (1005 at c) witnessed by d" in out["line"], out["line"]
     assert all(h != 1005 for _, h in calls), "the witness cost no call"
+
+
+# ---- round twenty-six: an eligible witness, and roles a machine can read --------------------
+
+def test_no_endpoint_whose_safe_head_reached_the_anchor_is_said_so_without_a_call():
+    """minia2auk, round 26: "no peer had reached the height" and "we asked a peer that was
+    behind" are different facts. The anchor is the highest finalized claim, so no peer's
+    finalized can have reached it; the bound is the peer's safe head. Here every peer's safe
+    is below 1100, so nobody is asked and the line says why."""
+    calls = []
+    fit = {"finalized_height": 1000, "finalized_hash": "0xa10", "host": "a"}
+    peers = {"https://b": (1000, "0xa10"), "https://d": (1100, "0xd11")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 50, 60),
+                                        header_fn=_finalized_chain({1000: "0xa10", 1100: "0xd11"}, calls),
+                                        sleep=lambda s: None, primary_url="https://a")
+    assert "no second witness: no other endpoint's safe head had reached 1100" in out["line"], out["line"]
+    assert all(h != 1100 for _, h in calls), "an ineligible endpoint is not asked"
+
+
+def test_an_endpoint_below_the_anchor_on_safe_is_skipped_for_one_that_has_reached_it():
+    calls = []
+    real = {990: "0x990", 1000: "0xa10", 1005: "0xa15"}
+    fit = {"finalized_height": 1000, "finalized_hash": "0xa10", "host": "a"}
+    read = {"https://lag": {"finalized": 1000, "safe": 1003, "latest": 1010},
+            "https://ok": {"finalized": 990, "safe": 1400, "latest": 1450},
+            "https://d": {"finalized": 1005, "safe": 1500, "latest": 1550}}
+    heads = lambda url: {tag: (read[url][tag], {"finalized": {1000: "0xa10", 990: "0x990", 1005: "0xa15"}[read[url]["finalized"]]}
+                               .get(tag, "0x%s" % tag), 0) for tag in ("finalized", "safe", "latest")}
+    out = reconcile.endpoint_crosscheck(fit, list(read), finality_fn=heads, header_fn=_finalized_chain(real, calls),
+                                        sleep=lambda s: None, primary_url="https://a")
+    assert "its top block (1005 at d) witnessed by ok" in out["line"], out["line"]
+    assert ("https://lag", 1005) not in calls and ("https://ok", 1005) in calls
+
+
+def test_a_contradiction_says_which_side_was_witnessed():
+    """An ancestry mismatch carries the anchor's status, so a reader can weigh it without the
+    docstring: witnessed by a second endpoint, or one unverified source."""
+    real = {1000: "0xa10", 1005: "0xa15"}
+    fit = {"finalized_height": 1005, "finalized_hash": "0xa15", "host": "a"}
+    peers = {"https://c": (1005, "0xa15"), "https://b": (1000, "0xbad")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
+                                        header_fn=_finalized_chain(real), sleep=lambda s: None)
+    assert out["smell"] is True
+    assert "0xbad finalized at b vs 0xa10 on c's chain (anchor, witnessed by a)" in out["line"], out["line"]
+    sides = out["contradictions"][0]["sides"]
+    assert sides[0]["role"] == "finalized claim" and sides[1]["role"] == "anchor, witnessed by a"
+
+
+def test_the_witness_is_kept_in_the_history_record(monkeypatch, tmp_path):
+    """The identity is the cheap part to keep: one call decides, and the record stays auditable."""
+    fit = {"host": "primary", "network": NET, "finalized_height": 1000, "finalized_hash": "0xa10",
+           "depth_blocks": 600, "depth_s": 1200, "safe_depth_blocks": 50, "smell": False, "reason": "", "history": ""}
+    monkeypatch.setattr(reconcile, "endpoint_fitness", lambda *a, **k: dict(fit))
+    monkeypatch.setattr(reconcile, "endpoint_crosscheck",
+                        lambda f, peers, **k: {"line": "cross-check: ok", "smell": False,
+                                               "witness": {"endpoint": "drpc", "height": 1000, "how": "finalized the same block"}})
+    monkeypatch.setattr(reconcile, "RPC", {NET: "https://primary"})
+    monkeypatch.delenv("SATLEDGER_RECONCILE_RPC", raising=False)
+    monkeypatch.setenv("SATLEDGER_FINALITY_SAMPLE", "%s=https://drpc|https://base" % NET)
+    monkeypatch.setattr(reconcile, "reconcile", lambda *a, **k: ([], 0))
+    log = tmp_path / "funnel.jsonl"
+    log.write_text(_line("settled", "0x" + "c1" * 32, "2026-10-21T10:00:00+00:00", tx="0xfac") + "\n")
+    history = tmp_path / "history.jsonl"
+    reconcile.main(["reconcile.py", str(log), "--history=%s" % history])
+    record = json.loads(history.read_text().splitlines()[-1])
+    assert record["endpoints"]["primary"]["witness"]["endpoint"] == "drpc"

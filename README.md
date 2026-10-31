@@ -70,7 +70,7 @@ The possible states:
 
 `final` means the evidence block is at or below the endpoint's L1-finalized head and carries that chain's hash at that height. A run that could measure nothing says `blind`, not `clean`.
 
-Peer endpoints' `finalized` claims are compared by hash before height. Two finalized blocks at one height, or a lower claim that is not on the highest claimant's chain, is reported as `undetermined` with the height and both hashes, and that network's rows are not judged. The highest claim anchors the others, so it is first witnessed by a second endpoint reporting the same block at that height; an anchor nobody else can confirm is stated on the line as unwitnessed. Every height comparison assumes the chain never finalizes two blocks at one height, so that assumption is checked, not inherited.
+Peer endpoints' `finalized` claims are compared by hash before height. Two finalized blocks at one height, or a lower claim that is not on the highest claimant's chain, is reported as `undetermined` with the height and both hashes, and that network's rows are not judged. The highest claim anchors the others, so it is first witnessed by a second endpoint reporting the same block at that height, asked only if its own `safe` head has reached that height. An anchor nobody else can confirm is stated on the line as unwitnessed, saying whether no endpoint had reached the height or the eligible ones did not answer. The witness is named on every verdict line, in the result and in the history record, and each side of a contradiction carries its role. Every height comparison assumes the chain never finalizes two blocks at one height, so that assumption is checked, not inherited.
 
 Exit codes:
 

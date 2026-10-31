@@ -183,10 +183,18 @@ its own (height, hash) would otherwise meet no second source: a peer
 inventing a finalized hash one step ahead, below another peer's tip,
 answers the lower heights from its real chain and passes every
 comparison. The anchor is therefore witnessed first - by a second claim
-at its height when there is one (no call), else by the first other
-endpoint that reports a block there (highest finalized first, so usually
-one call). A different hash is a contradiction; no answer is stated on
-the line as an unwitnessed anchor. Re-reading the anchor from its own
+at its height when there is one (no call), else by an eligible endpoint
+reporting the same block there (usually one call). Eligible means its
+own `safe` head has reached the anchor's height: its `finalized` cannot
+have (the anchor is the highest finalized claim by construction), and
+below `safe` the block is derived from L1 data, so a lagging sequencer
+head cannot pose as a contradiction. A different hash is a contradiction;
+"no endpoint's safe head had reached N" and "K eligible endpoints did not
+answer" are stated apart. The witness is one source: its identity is on
+every height-bearing line, in the result (`witness`) and in the history
+record, and each contradiction names the role of each side (anchor,
+witness, finalized claim, anchor witnessed or unwitnessed), so a later
+audit can tell one unverified source from two independent ones. Re-reading the anchor from its own
 endpoint was rejected: that is self-consistency, which a liar with a
 consistent local view passes, not corroboration. Attribution is
 asymmetric and the line does not resolve it: "X at b vs Y on a's chain"
@@ -598,57 +606,94 @@ def endpoint_finality(url: str) -> Optional[Dict[str, Any]]:
 CROSS_RETRY_SECONDS = 10
 
 
-def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str]],
-                              header_fn) -> Tuple[List[str], List[int], Optional[str]]:
-    """Finalized claims that cannot all lie on one chain, as printable pairs;
-    the lower heights that could not be compared; and the endpoint that
-    witnessed the top claim, or None.
+def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, Optional[int]]],
+                              header_fn) -> Dict[str, Any]:
+    """Finalized claims that cannot all lie on one chain, and who vouched for what.
 
-    Each claim is (host, url, height, hash). Claims at one height must carry
-    one hash. The highest claim anchors the rest, so it is witnessed first:
-    by a second claim at its height, or else by the first other endpoint
-    that reports a block there - a different hash is a contradiction, and
-    no answer leaves the anchor unwitnessed, which is stated. Then each
-    lower claim must match the hash the anchor's chain reports at its
-    height: if every claim lies on that one chain they lie on one chain
-    together, so one call per lower height covers every pair. A claimant
-    with no url, or a height it does not answer, is not compared and is
-    returned as such: the finding is a contradiction, never an absence."""
+    Each claim is (host, url, finalized height, hash, safe height or None).
+    Claims at one height must carry one hash. The highest claim anchors the
+    rest, so it is witnessed first: by a second claim at its height (no
+    call), or else by an eligible endpoint reporting the same block there.
+    Eligible means its own `safe` head has reached the anchor's height, so
+    the block it reports is derived from L1 data rather than a sequencer
+    head that could still move; asking an endpoint below that would turn
+    its lag into a false contradiction. No eligible endpoint and eligible
+    endpoints that did not answer are different facts and are reported
+    apart. Then each lower claim must match the hash the anchor's chain
+    reports at its height: if every claim lies on that one chain they lie
+    on one chain together, so one call per lower height covers every pair.
+    A height that is not answered is not compared and is returned as such:
+    the finding is a contradiction, never an absence.
+
+    Returns {"contradictions": [{"height", "text", "sides": [{"hash", "at",
+    "role"}, ...]}], "not_compared": [heights], "witness": {"endpoint",
+    "height", "how"} or None, "unwitnessed": reason or None, "anchor":
+    {"height", "at"}}."""
     claims = [c for c in claims if c[3]]
-    by_height: Dict[int, List[Tuple[str, Optional[str], int, str]]] = {}
+    result: Dict[str, Any] = {"contradictions": [], "not_compared": [], "witness": None, "unwitnessed": None,
+                              "anchor": None}
+    by_height: Dict[int, List[Tuple[str, Optional[str], int, str, Optional[int]]]] = {}
     for c in claims:
         by_height.setdefault(c[2], []).append(c)
-    found = ["height %d: %s at %s vs %s at %s" % (n, group[0][3][:12], group[0][0], c[3][:12], c[0])
-             for n, group in sorted(by_height.items()) for c in group[1:] if c[3] != group[0][3]]
-    if found or not by_height:
-        return found, [], None
+    for n, group in sorted(by_height.items()):
+        for c in group[1:]:
+            if c[3] != group[0][3]:
+                result["contradictions"].append({
+                    "height": n, "text": "height %d: %s finalized at %s vs %s finalized at %s" % (
+                        n, group[0][3][:12], group[0][0], c[3][:12], c[0]),
+                    "sides": [{"hash": group[0][3], "at": [group[0][0]], "role": "finalized claim"},
+                              {"hash": c[3], "at": [c[0]], "role": "finalized claim"}]})
+    if result["contradictions"] or not by_height:
+        return result
     top = max(by_height)
     anchors = by_height[top]
-    names = ", ".join(c[0] for c in anchors)
-    witness = anchors[1][0] if len(anchors) > 1 else None
-    if witness is None:
-        # Highest first: the endpoint most likely to have produced the block.
-        for c in sorted((c for c in claims if c[2] != top and c[1]), key=lambda c: -c[2]):
+    names = [c[0] for c in anchors]
+    # With a tie the first claim is the anchor and the second its witness.
+    result["anchor"] = {"height": top, "at": names if len(anchors) == 1 else names[:1]}
+    if len(anchors) > 1:
+        result["witness"] = {"endpoint": anchors[1][0], "height": top, "how": "finalized the same block"}
+    else:
+        eligible = sorted((c for c in claims if c[2] != top and c[1] and c[4] is not None and c[4] >= top),
+                          key=lambda c: -c[4])
+        for c in eligible:
             theirs = ((header_fn(c[1], top) or (None, None, None))[1] or "").lower()
             if not theirs:
                 continue
             if theirs != anchors[0][3]:
-                return ["height %d: %s at %s vs %s on %s's chain" % (top, anchors[0][3][:12], names, theirs[:12], c[0])], [], None
-            witness = c[0]
+                result["contradictions"].append({
+                    "height": top, "text": "height %d: %s finalized at %s (anchor) vs %s at %s (witness, safe %d)" % (
+                        top, anchors[0][3][:12], ", ".join(names), theirs[:12], c[0], c[4]),
+                    "sides": [{"hash": anchors[0][3], "at": names, "role": "anchor"},
+                              {"hash": theirs, "at": [c[0]], "role": "witness"}]})
+                return result
+            result["witness"] = {"endpoint": c[0], "height": top, "how": "reports the block below its safe head %d" % c[4]}
             break
+        else:
+            result["unwitnessed"] = ("no other endpoint's safe head had reached %d" % top if not eligible else
+                                     "%d endpoint(s) whose safe head had reached %d did not answer" % (len(eligible), top))
     asker = next((c for c in anchors if c[1]), None)
     lower = sorted(n for n in by_height if n != top)
     if asker is None:
-        return found, lower, witness
-    unasked = []
+        result["not_compared"] = lower
+        return result
+    # The chain asked is the anchor's, or with a tie its witness's: either way it
+    # is vouched for by the other one.
+    other = (result["witness"] or {}).get("endpoint")
+    if other == asker[0]:
+        other = anchors[0][0]
+    vouched = "anchor, witnessed by %s" % other if other else "anchor, unwitnessed"
     for n in lower:
         theirs = ((header_fn(asker[1], n) or (None, None, None))[1] or "").lower()
         if not theirs:
-            unasked.append(n)
+            result["not_compared"].append(n)
         elif theirs != by_height[n][0][3]:
-            found.append("height %d: %s at %s vs %s on %s's chain" % (
-                n, by_height[n][0][3][:12], ", ".join(c[0] for c in by_height[n]), theirs[:12], asker[0]))
-    return found, unasked, witness
+            at = [c[0] for c in by_height[n]]
+            result["contradictions"].append({
+                "height": n, "text": "height %d: %s finalized at %s vs %s on %s's chain (%s)" % (
+                    n, by_height[n][0][3][:12], ", ".join(at), theirs[:12], asker[0], vouched),
+                "sides": [{"hash": by_height[n][0][3], "at": at, "role": "finalized claim"},
+                          {"hash": theirs, "at": [asker[0]], "role": vouched}]})
+    return result
 
 
 def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None, header_fn=None,
@@ -708,15 +753,23 @@ def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None,
     # fail - a peer on a minority fork, or one overstating its finalized,
     # wins on height alone - so the hashes are compared first, and a
     # contradiction is the finding instead of any height verdict.
-    claims = [(fit.get("host") or "primary", primary_url, height, block_hash)]
-    claims += [(r[0], r[1], r[2], (r[3] or "").lower()) for r in seen]
-    contradictions, unasked, witness = _finalized_contradictions(claims, header_fn)
-    top_claim = max(claims, key=lambda c: c[2])
+    primary_safe = None
+    if fit.get("depth_blocks") is not None and fit.get("safe_depth_blocks") is not None:
+        primary_safe = height + fit["depth_blocks"] - fit["safe_depth_blocks"]
+    claims = [(fit.get("host") or "primary", primary_url, height, block_hash, primary_safe)]
+    claims += [(r[0], r[1], r[2], (r[3] or "").lower(), r[4]) for r in seen]
+    hashes = _finalized_contradictions(claims, header_fn)
+    contradictions, unasked = [c["text"] for c in hashes["contradictions"]], hashes["not_compared"]
+    # The witness travels with every verdict, so an audit can tell one unverified
+    # source from two independent ones without reading this file.
+    out["witness"], out["contradictions"] = hashes["witness"], hashes["contradictions"]
     chain = ("every finalized hash lies on one chain" if not unasked else
              "no finalized hashes contradict; not compared at height(s) %s" % ", ".join(map(str, unasked)))
-    chain += (", its top block %d witnessed by %s" % (top_claim[2], witness) if witness else
-              "; the top claim (%d at %s) has no second witness, so the chain it anchors is unconfirmed"
-              % (top_claim[2], top_claim[0]))
+    if hashes["anchor"]:
+        anchor = "%d at %s" % (hashes["anchor"]["height"], ", ".join(hashes["anchor"]["at"]))
+        chain += (", its top block (%s) witnessed by %s" % (anchor, hashes["witness"]["endpoint"]) if hashes["witness"]
+                  else "; the top claim (%s) has no second witness: %s, so the chain it anchors is unconfirmed"
+                  % (anchor, hashes["unwitnessed"]))
     undetermined = ("cross-check: undetermined - finalized claims contradict (%s): one chain cannot finalize two "
                     "blocks at one height, and every verdict here ranks heights on that assumption, so none is "
                     "given (%s)" % ("; ".join(contradictions), where))
@@ -2049,7 +2102,7 @@ def main(argv: List[str]) -> int:
             f["cross"] = "" if f["smell"] else "single endpoint: a clamp just below an honest safe is not checkable"
             continue
         cross = endpoint_crosscheck(f, peers, primary_url=RPC[f["network"]])
-        f["cross"] = cross["line"]
+        f["cross"], f["witness"] = cross["line"], cross.get("witness")
         if cross["smell"]:
             f["smell"], f["reason"] = True, cross["line"]
     smelly = {f["network"] for f in fitness if f["smell"]}
@@ -2069,7 +2122,8 @@ def main(argv: List[str]) -> int:
         record = apply_history(rows, records, at, word)
         record["endpoints"] = {f["host"]: {"depth_blocks": f["depth_blocks"], "depth_s": f["depth_s"],
                                            "safe_depth_blocks": f["safe_depth_blocks"],
-                                           "finalized_height": f["finalized_height"], "smell": f["smell"]}
+                                           "finalized_height": f["finalized_height"], "smell": f["smell"],
+                                           "witness": f.get("witness")}
                                for f in fitness}
         with open(history, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
