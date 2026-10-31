@@ -1348,7 +1348,8 @@ def test_an_honest_lead_of_one_finality_step_is_drift_not_a_clamp():
     peers = {"https://publicnode": (53317802, "0xold"), "https://blast": (53317802, "0xold"),
              "https://1rpc": (53316253, "0xolder")}
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), sleep=lambda s: None)
-    assert out["smell"] is False and "drift, not a clamp" in out["line"] and "leads every peer by 186" in out["line"]
+    assert out["smell"] is False and "drift, not a clamp" in out["line"] and "by 186 blocks" in out["line"]
+    assert "publicnode (53317802, 53318372, 53318422)" in out["line"], "each peer's triple is printed"
 
 
 def test_a_finalized_block_above_every_peer_tip_is_fabricated():
@@ -1380,7 +1381,54 @@ def test_quorum_is_required_of_the_re_read_the_verdict_rests_on():
         current.update(next(reads))
     current.update(next(reads))
     out = reconcile.endpoint_crosscheck(fit, ["https://a", "https://b"], finality_fn=heads, sleep=sleep)
-    assert out["smell"] is False and "answered the re-read; no quorum" in out["line"] and out["answered"] == 1
+    assert out["smell"] is False and "answered the re-read stably; no quorum" in out["line"] and out["answered"] == 1
+
+
+def _scripted(reads):
+    """finality_fn and sleep that serve reads[0] until the re-read, then reads[1].
+    Each read is {url: {"finalized": n, "safe": n or None, "latest": n or None}}."""
+    state = {"i": 0}
+
+    def heads(url):
+        got = reads[state["i"]].get(url)
+        if got is None:
+            return None
+        return {tag: (got[tag], "0x%s" % tag, 0) for tag in ("finalized", "safe", "latest") if got.get(tag) is not None}
+
+    def sleep(seconds):
+        state["i"] = 1
+    return heads, sleep
+
+
+def test_the_gap_never_pairs_one_peers_safe_with_anothers_finalized():
+    """minia2auk, round 21: A safe 1000 / finalized 900, B finalized 1005 and no safe.
+    max(safe) - max(finalized) = -5, and any lead fired as a clamp. B has no ladder,
+    and A's is stale (B finalized past A's safe), so nothing sizes the lead."""
+    read = {"https://a": {"finalized": 900, "safe": 1000, "latest": 1050},
+            "https://b": {"finalized": 1005, "safe": None, "latest": 1060}}
+    heads, sleep = _scripted([read, read])
+    out = reconcile.endpoint_crosscheck({"finalized_height": 1010, "finalized_hash": "0x"}, list(read),
+                                        finality_fn=heads, sleep=sleep)
+    # B has finalized past A's safe, so A's ladder is stale and sizes nothing
+    assert out["smell"] is False and "not judged" in out["line"] and "b (1005, None, 1060)" in out["line"]
+    read["https://a"]["safe"] = 1200
+    heads, sleep = _scripted([read, read])
+    out = reconcile.endpoint_crosscheck({"finalized_height": 1010, "finalized_hash": "0x"}, list(read),
+                                        finality_fn=heads, sleep=sleep)
+    assert out["smell"] is False and "leads a by 110 blocks" in out["line"] and "gap of 300" in out["line"]
+
+
+def test_a_peer_whose_finalized_goes_backwards_is_dropped_by_name():
+    """Live, 31 Oct: publicnode answered 53317988, then 53317802, from one URL."""
+    first = {"https://publicnode": {"finalized": 53317988, "safe": 53318560, "latest": 53318610},
+             "https://blast": {"finalized": 53317802, "safe": 53318560, "latest": 53318610},
+             "https://drpc": {"finalized": 53317802, "safe": 53318560, "latest": 53318610}}
+    second = dict(first, **{"https://publicnode": {"finalized": 53317802, "safe": 53318560, "latest": 53318610}})
+    heads, sleep = _scripted([first, second])
+    out = reconcile.endpoint_crosscheck({"finalized_height": 53317990, "finalized_hash": "0x"}, list(first),
+                                        finality_fn=heads, sleep=sleep)
+    assert "unstable, dropped: publicnode (53317988 -> 53317802)" in out["line"]
+    assert out["answered"] == 2 and out["smell"] is False
 
 
 def test_drift_is_not_a_clamp_and_hashes_decide_at_one_height():

@@ -140,9 +140,16 @@ because finality advances in jumps and they read at different moments, so
 height alone is never the verdict. Three things are:
   - the primary's finalized height is above every peer's `latest`: a block
     no independent endpoint has even produced - fabricated;
-  - the primary is ahead of every peer's finalized height by more than half
-    the peers' own finalized-to-safe gap, after one re-read
-    CROSS_RETRY_SECONDS later: a clamp. Being ahead is not the evidence. On
+  - the primary is ahead of every peer's finalized height, and after one
+    re-read CROSS_RETRY_SECONDS later it is above the midpoint of the
+    freshest peer's own finalized and safe - nearer that peer's safe than
+    its finalized: a clamp. Each midpoint comes from one peer's own
+    ladder, so a subtraction never pairs one peer's `safe` with another's
+    `finalized` (that pairing can go negative, and then any lead fires).
+    A peer whose `safe` is at or below another peer's `finalized` is stale -
+    the chain has finalized past it - and sizes nothing; with no usable
+    ladder the lead is "not judged".
+    Being ahead is not the evidence. On
     31 Oct 2026, sampled every 5 s, mainnet.base.org reached a new finalized
     height about 290 s before blastapi did, blastapi staying one step (186
     blocks) behind throughout, and publicnode and drpc alternated between
@@ -154,12 +161,21 @@ height alone is never the verdict. Three things are:
   - the peers that have finalized that height report a different hash
     there, by majority: a fork or a fabricated block.
 A peer one step behind lands below the primary with the same hash: drift,
-not a fault. At least two peers must answer the reading the verdict rests
-on, the re-read included, or the line says "no quorum". A clamp that claims
+not a fault. A peer whose `finalized` is lower on the re-read than on the
+first read is unstable - one URL in front of backends at different heights
+- and is dropped from that verdict by name: its answer is a sample of a
+backend, not of the chain. At least two stable peers must answer the
+reading the verdict rests on, the re-read included, or the line says "no
+quorum". Every lead verdict prints each peer's (finalized, safe, latest), so
+one outlier and a whole stale set do not read alike. A clamp that claims
 less than half the gap early is indistinguishable, in one run, from the
 freshest peer lagging one step; so is an honest primary whose freshest
-peer lags two steps, which reads as a clamp - loud, and it prints the
-heights.
+peer lags two steps, which reads as a clamp - loud, and the per-peer
+triples show whether the whole set is stale (one provider's cache under
+several names). The midpoint is the threshold rather than a third of the
+gap: Base's gap swings between ~380 and ~630 blocks with the finality
+sawtooth, so a third falls to ~130 and calls the measured honest lead of
+186 a clamp.
 What this cannot see: a majority of the sample agreeing on the same wrong
 answer, peers that are one backend under several names (two public Base
 endpoints return identical answers to the hash, which is a hint of a
@@ -560,59 +576,67 @@ def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None,
         return out
 
     def read():
-        got, tags = [], {"latest": [], "safe": []}
+        got = []
         for peer in peers:
             heads = finality_fn(peer) or {}
             fin = heads.get("finalized")
             if fin:
-                got.append((_host(peer), peer, fin[0], fin[1]))
-                for tag in tags:
-                    if heads.get(tag):
-                        tags[tag].append(heads[tag][0])
-        return got, tags
-    seen, tags = read()
+                got.append((_host(peer), peer, fin[0], fin[1],
+                            (heads.get("safe") or (None,))[0], (heads.get("latest") or (None,))[0]))
+        return got
+    seen = read()
     reading = "first read"
     out["answered"] = len(seen)
     if len(seen) < 2:
         out["line"] = "cross-check: %d of %d peers answered `finalized`; no quorum" % (len(seen), len(peers))
         return out
-    if height > max(n for _, _, n, _ in seen):
+    unstable: List[str] = []
+    if height > max(r[2] for r in seen):
+        before = {r[1]: r[2] for r in seen}
         sleep(CROSS_RETRY_SECONDS)
-        seen, tags = read()
+        again = read()
+        unstable = ["%s (%d -> %d)" % (r[0], before[r[1]], r[2]) for r in again if r[2] < before.get(r[1], -1)]
+        seen = [r for r in again if r[2] >= before.get(r[1], -1)]
         reading = "re-read %d s later" % CROSS_RETRY_SECONDS
         out["answered"] = len(seen)
+        dropped = "; unstable, dropped: %s" % ", ".join(unstable) if unstable else ""
         if len(seen) < 2:
             # The verdict rests on the reading it names. The first read is
             # not reused: a fallback printed as a re-confirmation is the
             # kind of line this file exists to refuse.
-            out["line"] = ("cross-check: finalized %d was ahead of every peer, and %d of %d peers answered the re-read; "
-                           "no quorum" % (height, len(seen), len(peers)))
+            out["line"] = ("cross-check: finalized %d was ahead of every peer, and %d of %d peers answered the re-read "
+                           "stably; no quorum%s" % (height, len(seen), len(peers), dropped))
             return out
     top = max(seen, key=lambda r: r[2])
     if height > top[2]:
-        lead = height - top[2]
-        tip = max(tags["latest"]) if tags["latest"] else None
-        safe = max(tags["safe"]) if tags["safe"] else None
-        where = "%s: highest peer finalized %d at %s" % (reading, top[2], top[0])
-        if tip is not None and height > tip:
+        triples = "; ".join("%s (%s, %s, %s)" % (r[0], r[2], r[4], r[5]) for r in seen)
+        where = "%s; peers (finalized, safe, latest): %s%s" % (
+            reading, triples, "; unstable, dropped: %s" % ", ".join(unstable) if unstable else "")
+        tips = [r[5] for r in seen if r[5] is not None]
+        # A ladder whose safe is at or below some peer's finalized is stale:
+        # the chain has already finalized past it, so it sizes nothing.
+        ladders = [r for r in seen if r[4] is not None and r[4] > top[2]]
+        if tips and height > max(tips):
             out["smell"] = True
             out["line"] = ("cross-check: finalized %d is above every peer's latest block (%d) - a block no independent "
-                           "endpoint has produced (%s)" % (height, tip, where))
-        elif safe is None or safe <= top[2]:
-            out["line"] = ("cross-check: finalized %d leads every peer by %d blocks and no peer gave a usable `safe` to "
-                           "size the lead against; not judged (%s)" % (height, lead, where))
-        elif lead * 2 > safe - top[2]:
-            out["smell"] = True
-            out["line"] = ("cross-check: finalized %d leads every peer by %d blocks, more than half the peers' "
-                           "finalized-to-safe gap of %d - nearer their safe than their finalized: a clamp (%s)"
-                           % (height, lead, safe - top[2], where))
+                           "endpoint has produced (%s)" % (height, max(tips), where))
+        elif not ladders:
+            out["line"] = ("cross-check: finalized %d leads every peer by %d blocks and no peer gave a `safe` above the "
+                           "highest peer `finalized` to size the lead against; not judged (%s)" % (height, height - top[2], where))
         else:
-            out["line"] = ("cross-check: finalized %d leads every peer by %d blocks, under half the peers' "
-                           "finalized-to-safe gap of %d - one finality step: drift, not a clamp (%s)"
-                           % (height, lead, safe - top[2], where))
+            ref = max(ladders, key=lambda r: r[2] + r[4])
+            lead, gap = height - ref[2], ref[4] - ref[2]
+            if lead * 2 > gap:
+                out["smell"] = True
+                out["line"] = ("cross-check: finalized %d leads %s by %d blocks, more than half its own finalized-to-safe "
+                               "gap of %d - nearer its safe than its finalized: a clamp (%s)"
+                               % (height, ref[0], lead, gap, where))
+            else:
+                out["line"] = ("cross-check: finalized %d leads %s by %d blocks, under half its own finalized-to-safe "
+                               "gap of %d - one finality step: drift, not a clamp (%s)" % (height, ref[0], lead, gap, where))
         return out
     agree, differ = [], []
-    for host, peer, n, h in seen:
+    for host, peer, n, h, _, _ in seen:
         if n < height:
             continue                                     # one batch behind: drift, not a vote
         other = h if n == height else (header_fn(peer, height) or (None, None, None))[1]
@@ -624,7 +648,7 @@ def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None,
         out["line"] = ("cross-check: at height %d the majority of peers that finalized it report another hash (%s) - "
                        "a fork or a fabricated block" % (height, ", ".join(differ)))
     else:
-        behind = sum(1 for _, _, n, _ in seen if n < height)
+        behind = sum(1 for r in seen if r[2] < height)
         out["line"] = ("cross-check: finalized %d agrees with %d peer(s)%s%s" % (
             height, len(agree), ", %d behind (drift)" % behind if behind else "",
             ", %d disagree (minority)" % len(differ) if differ else ""))

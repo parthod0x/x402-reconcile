@@ -87,7 +87,7 @@ These limits are stated in the docstring and repeated here:
 - peers that are one backend under several names;
 - a deployment with only one source of chain data;
 - a provider that returns an ordered log answer with a block missing from the middle;
-- a clamp that claims `finalized` less than half the peers' finalized-to-safe gap early, which looks like the freshest peer lagging one finality step. The reverse also happens: an honest primary whose freshest peer lags two steps reads as a clamp. That failure is loud and prints the heights.
+- a clamp that claims `finalized` less than halfway from the freshest peer's own `finalized` to its own `safe`, which looks like the freshest peer lagging one finality step. The reverse also happens: an honest primary whose freshest peer lags two steps reads as a clamp. That failure is loud and prints the heights.
 
 ## Tests
 
