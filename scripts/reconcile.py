@@ -163,6 +163,21 @@ height alone is never the verdict. Three things are:
     no chain constant is needed;
   - the peers that have finalized that height report a different hash
     there, by majority: a fork or a fabricated block.
+All three rank heights, and ranking heights rests on an assumption that is
+the chain's, not this code's: the safety half of finality - no chain
+finalizes two blocks at one height. A peer on a minority fork after an
+incident, or one overstating how far it has finalized, advertises a higher
+`finalized` and wins any comparison of numbers. So hashes are compared
+first, across every claim, the primary's included: claims at one height
+must carry one hash, and each lower claim must be the block the highest
+claimant's chain reports at that height (one call per lower height: if
+all lie on that one chain, all lie on one chain together). A contradiction
+is "undetermined", printing the height and both hashes, and no height
+verdict is given beside it - a minority that disagrees included, since a
+vote between two finalized blocks at one height settles nothing. Only a
+block above every peer's tip ("fabricated") is still reported first, as
+it rests on no hash. A height the asked endpoint does not answer is an
+absence and is not compared.
 A peer one step behind lands below the primary with the same hash: drift,
 not a fault. A peer whose `finalized` is lower on the re-read than on the
 first read is unstable - one URL in front of backends at different heights
@@ -568,8 +583,43 @@ def endpoint_finality(url: str) -> Optional[Dict[str, Any]]:
 CROSS_RETRY_SECONDS = 10
 
 
+def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str]],
+                              header_fn) -> Tuple[List[str], List[int]]:
+    """Finalized claims that cannot all lie on one chain, as printable pairs,
+    and the lower heights that could not be compared.
+
+    Each claim is (host, url, height, hash). Claims at one height must carry
+    one hash. A lower claim must match the hash the highest claimant's chain
+    reports at that height: if every claim lies on that one chain they lie
+    on one chain together, so one call per lower height covers every pair.
+    A claimant with no url, or a height it does not answer, is not compared
+    and is returned as such: the finding is a contradiction, never an absence."""
+    claims = [c for c in claims if c[3]]
+    by_height: Dict[int, List[Tuple[str, Optional[str], int, str]]] = {}
+    for c in claims:
+        by_height.setdefault(c[2], []).append(c)
+    found = ["height %d: %s at %s vs %s at %s" % (n, group[0][3][:12], group[0][0], c[3][:12], c[0])
+             for n, group in sorted(by_height.items()) for c in group[1:] if c[3] != group[0][3]]
+    if found or len(by_height) < 2:
+        return found, []
+    top = max(by_height)
+    asker = next((c for c in by_height[top] if c[1]), None)
+    lower = sorted(n for n in by_height if n != top)
+    if asker is None:
+        return found, lower
+    unasked = []
+    for n in lower:
+        theirs = ((header_fn(asker[1], n) or (None, None, None))[1] or "").lower()
+        if not theirs:
+            unasked.append(n)
+        elif theirs != by_height[n][0][3]:
+            found.append("height %d: %s at %s vs %s on %s's chain" % (
+                n, by_height[n][0][3][:12], ", ".join(c[0] for c in by_height[n]), theirs[:12], asker[0]))
+    return found, unasked
+
+
 def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None, header_fn=None,
-                        sleep=None) -> Dict[str, Any]:
+                        sleep=None, primary_url: Optional[str] = None) -> Dict[str, Any]:
     """Compare the primary's finalized block with peer endpoints; see the module docstring."""
     import time
     finality_fn = finality_fn or endpoint_finality
@@ -617,10 +667,21 @@ def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None,
                            "stably; no quorum%s" % (height, len(seen), len(peers), dropped))
             return out
     top = max(seen, key=lambda r: r[2])
+    triples = "; ".join("%s (%s, %s, %s)" % (r[0], r[2], r[4], r[5]) for r in seen)
+    where = "%s; peers (finalized, safe, latest): %s%s" % (
+        reading, triples, "; unstable, dropped: %s" % ", ".join(unstable) if unstable else "")
+    # Every height comparison below assumes finality's safety half: no chain
+    # finalizes two blocks at one height. Ranking heights cannot see that
+    # fail - a peer on a minority fork, or one overstating its finalized,
+    # wins on height alone - so the hashes are compared first, and a
+    # contradiction is the finding instead of any height verdict.
+    claims = [(fit.get("host") or "primary", primary_url, height, block_hash)]
+    claims += [(r[0], r[1], r[2], (r[3] or "").lower()) for r in seen]
+    contradictions, unasked = _finalized_contradictions(claims, header_fn)
+    undetermined = ("cross-check: undetermined - finalized claims contradict (%s): one chain cannot finalize two "
+                    "blocks at one height, and every verdict here ranks heights on that assumption, so none is "
+                    "given (%s)" % ("; ".join(contradictions), where))
     if height > top[2]:
-        triples = "; ".join("%s (%s, %s, %s)" % (r[0], r[2], r[4], r[5]) for r in seen)
-        where = "%s; peers (finalized, safe, latest): %s%s" % (
-            reading, triples, "; unstable, dropped: %s" % ", ".join(unstable) if unstable else "")
         tips = [r[5] for r in seen if r[5] is not None]
         # A ladder whose safe is at or below some peer's finalized is stale:
         # the chain has already finalized past it, so it sizes nothing.
@@ -629,6 +690,8 @@ def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None,
             out["smell"] = True
             out["line"] = ("cross-check: finalized %d is above every peer's latest block (%d) - a block no independent "
                            "endpoint has produced (%s)" % (height, max(tips), where))
+        elif contradictions:
+            out["smell"], out["undetermined"], out["line"] = True, True, undetermined
         elif not ladders:
             out["line"] = ("cross-check: finalized %d leads every peer by %d blocks and no peer gave a `safe` above the "
                            "highest peer `finalized` to size the lead against; not judged (%s)" % (height, height - top[2], where))
@@ -663,11 +726,16 @@ def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None,
         out["smell"] = True
         out["line"] = ("cross-check: at height %d the majority of peers that finalized it report another hash (%s) - "
                        "a fork or a fabricated block" % (height, ", ".join(differ)))
+    elif contradictions:
+        # A minority that disagrees, or two peers that disagree with each
+        # other: not a lag, and not something a vote between them settles.
+        out["smell"], out["undetermined"], out["line"] = True, True, undetermined
     else:
         behind = sum(1 for r in seen if r[2] < height)
-        out["line"] = ("cross-check: finalized %d agrees with %d peer(s)%s%s" % (
+        out["line"] = ("cross-check: finalized %d agrees with %d peer(s)%s; %s" % (
             height, len(agree), ", %d behind (drift)" % behind if behind else "",
-            ", %d disagree (minority)" % len(differ) if differ else ""))
+            "every finalized hash lies on one chain" if not unasked else
+            "no finalized hashes contradict; not compared at height(s) %s" % ", ".join(map(str, unasked))))
     return out
 
 
@@ -1943,7 +2011,7 @@ def main(argv: List[str]) -> int:
         if f["smell"] or not peers:
             f["cross"] = "" if f["smell"] else "single endpoint: a clamp just below an honest safe is not checkable"
             continue
-        cross = endpoint_crosscheck(f, peers)
+        cross = endpoint_crosscheck(f, peers, primary_url=RPC[f["network"]])
         f["cross"] = cross["line"]
         if cross["smell"]:
             f["smell"], f["reason"] = True, cross["line"]

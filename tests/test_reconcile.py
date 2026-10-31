@@ -1434,16 +1434,26 @@ def test_a_peer_whose_finalized_goes_backwards_is_dropped_by_name():
     assert out["answered"] == 2 and out["smell"] is False
 
 
+def _finalized_chain(hashes, calls=None):
+    """header_fn for one canonical chain: {height: hash}, None above or between them."""
+    def header(url, height):
+        if calls is not None:
+            calls.append((url, height))
+        return (height, hashes[height], 0) if height in hashes else None
+    return header
+
+
 def test_drift_is_not_a_clamp_and_hashes_decide_at_one_height():
     """Live, 30 Oct: publicnode and drpc at 53274399, mainnet.base.org and blastapi at 53274228, 1rpc 53272688."""
     fit = {"finalized_height": 53274399, "finalized_hash": "0x48fd"}
     peers = {"https://drpc": (53274399, "0x48fd"), "https://base": (53274228, "0xb9fe"), "https://1rpc": (53272688, "0x4749")}
-    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers), sleep=lambda s: None)
+    chain = _finalized_chain({53274399: "0x48fd", 53274228: "0xb9fe", 53272688: "0x4749"})
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers), header_fn=chain, sleep=lambda s: None)
     assert out["smell"] is False and "agrees with 1 peer(s), 2 behind (drift)" in out["line"]
+    assert "every finalized hash lies on one chain" in out["line"]
     # primary behind a peer: that peer is asked for its hash at the primary's height
     fit = {"finalized_height": 53274228, "finalized_hash": "0xb9fe"}
-    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers),
-                                        header_fn=lambda url, h: (h, "0xb9fe", 0), sleep=lambda s: None)
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers), header_fn=chain, sleep=lambda s: None)
     assert out["smell"] is False and "agrees with 2 peer(s)" in out["line"]
 
 
@@ -1477,3 +1487,59 @@ def test_the_ladder_is_the_freshest_not_the_one_behind_with_the_top_safe():
                                         finality_fn=heads, sleep=sleep)
     assert out["smell"] is True and "293 into fresh's ladder (1000, 1580)" in out["line"], out["line"]
 
+
+
+# ---- round twenty-four: the safety assumption, checked rather than inherited ----------------
+
+def test_two_peers_at_one_finalized_height_with_two_hashes_is_undetermined():
+    """minia2auk, round 24: a disagreement on height is a lag; agreement on height with two
+    hashes is not, and no vote between the two settles it. The primary agrees with one of them
+    and is ahead of neither, which used to read as agreement with a disagreeing minority."""
+    fit = {"finalized_height": 1000, "finalized_hash": "0xaaa"}
+    peers = {"https://a": (1000, "0xaaa"), "https://b": (1200, "0xb12"), "https://c": (1200, "0xc12")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
+                                        header_fn=_finalized_chain({1000: "0xaaa"}), sleep=lambda s: None)
+    assert out["smell"] is True and out["undetermined"] is True
+    assert out["line"].startswith("cross-check: undetermined") and "height 1200: 0xb12 at b vs 0xc12 at c" in out["line"]
+
+
+def test_a_peer_overstating_finalized_on_another_chain_does_not_win_on_height():
+    """The case comparing equal heights cannot see: the forked peer advertises a higher
+    finalized than anyone, so it shares no height with them. Its own chain is asked for the
+    others' finalized heights and reports different blocks there."""
+    fit = {"finalized_height": 1000, "finalized_hash": "0xaaa", "host": "primary"}
+    peers = {"https://a": (1000, "0xaaa"), "https://b": (990, "0x990"), "https://fork": (1400, "0xf14")}
+    fork_chain = _finalized_chain({1000: "0xf10", 990: "0xf99"})
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
+                                        header_fn=fork_chain, sleep=lambda s: None)
+    assert out["smell"] is True and out["undetermined"] is True
+    assert "height 1000: 0xaaa at primary, a vs 0xf10 on fork's chain" in out["line"], out["line"]
+    assert "height 990: 0x990 at b vs 0xf99 on fork's chain" in out["line"]
+
+
+def test_a_leading_primary_is_asked_for_the_peers_finalized_blocks():
+    """In the lead branch the primary is the highest claim, so its own chain is asked for
+    each peer's finalized height: a lead on a fork is a contradiction, not drift."""
+    fit = {"finalized_height": 53317988, "finalized_hash": "0xnew"}
+    peers = {"https://publicnode": (53317802, "0xold"), "https://blast": (53317802, "0xold"),
+             "https://1rpc": (53316253, "0xolder")}
+    calls = []
+    honest = _finalized_chain({53317802: "0xold", 53316253: "0xolder"}, calls)
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), header_fn=honest,
+                                        sleep=lambda s: None, primary_url="https://primary")
+    assert out["smell"] is False and "drift, not a clamp" in out["line"]
+    assert sorted(calls) == [("https://primary", 53316253), ("https://primary", 53317802)], "one call per lower height"
+    forked = _finalized_chain({53317802: "0xfork", 53316253: "0xolder"})
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), header_fn=forked,
+                                        sleep=lambda s: None, primary_url="https://primary")
+    assert out["smell"] is True and "height 53317802: 0xold at publicnode, blast vs 0xfork" in out["line"]
+
+
+def test_a_height_the_highest_claimant_does_not_answer_is_not_a_contradiction():
+    """A load-balanced backend behind the asked URL may not have the height: an absence, not a finding."""
+    fit = {"finalized_height": 1000, "finalized_hash": "0xaaa"}
+    peers = {"https://a": (1000, "0xaaa"), "https://b": (1200, "0xb12"), "https://c": (900, "0x900")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
+                                        header_fn=lambda url, h: None, sleep=lambda s: None)
+    assert out["smell"] is False and "undetermined" not in out["line"]
+    assert "not compared at height(s) 900, 1000" in out["line"], "an absence is stated, not passed off as agreement"
