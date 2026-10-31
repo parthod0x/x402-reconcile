@@ -1464,8 +1464,11 @@ def test_fewer_than_two_peers_is_no_quorum_not_a_verdict():
 def test_the_ladder_is_the_freshest_not_the_one_behind_with_the_top_safe():
     """minia2auk, round 22: ranking by finalized + safe (= 2*finalized + gap) let a peer behind
     on finalized but carrying a higher safe size the bar. Safe cannot pass the tip, so the stale
-    peer wins only while it lags by less than the fresh peer's safe-to-tip distance: the effect
-    is small, and real at the boundary. Here 1293 is past fresh's midpoint (1290) and short of
+    peer wins only while it lags by less than the fresh peer's safe-to-tip distance. That
+    distance is a property of the chain, not of this rule: 45-60 blocks on Base, read from
+    base-rpc.publicnode.com on 30-31 Oct 2026, where the effect is small. A chain with a longer
+    safe-to-tip distance admits a larger inversion under the old key. The current key ranks by
+    finalized alone and needs no such bound anywhere. Here 1293 is past fresh's midpoint (1290) and short of
     stale's (1295), so the old key called a clamp drift."""
     read = {"https://fresh": {"finalized": 1000, "safe": 1580, "latest": 1630},
             "https://stale": {"finalized": 960, "safe": 1630, "latest": 1630}}
