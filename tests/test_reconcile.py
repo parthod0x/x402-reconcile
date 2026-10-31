@@ -1551,7 +1551,8 @@ def test_a_height_the_highest_claimant_does_not_answer_is_not_a_contradiction():
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
                                         header_fn=lambda url, h: None, sleep=lambda s: None)
     assert out["smell"] is False and "undetermined" not in out["line"]
-    assert "not compared at height(s) 900, 1000" in out["line"], "an absence is stated, not passed off as agreement"
+    assert "not compared at height(s) 900 (b: no block), 1000 (b: no block)" in out["line"], \
+        "an absence is stated, not passed off as agreement"
 
 
 # ---- round twenty-five: the anchor is a claim with a witness, not an assumption -------------
@@ -1590,7 +1591,7 @@ def test_a_top_claim_nobody_else_reports_is_stated_unwitnessed():
                                         sleep=lambda s: None, primary_url="https://a")
     assert out["smell"] is False
     assert ("the top claim (1005 at d) has no second witness: 1 endpoint(s) whose safe head had reached 1005 "
-            "did not answer, so the chain it anchors is unconfirmed") in out["line"], out["line"]
+            "gave no block there (b at safe 1570: no block), so the chain it anchors is unconfirmed") in out["line"], out["line"]
     assert out["witness"] is None
 
 
@@ -1658,7 +1659,8 @@ def test_the_witness_is_kept_in_the_history_record(monkeypatch, tmp_path):
     monkeypatch.setattr(reconcile, "endpoint_fitness", lambda *a, **k: dict(fit))
     monkeypatch.setattr(reconcile, "endpoint_crosscheck",
                         lambda f, peers, **k: {"line": "cross-check: ok", "smell": False,
-                                               "witness": {"endpoint": "drpc", "height": 1000, "how": "finalized the same block"}})
+                                               "witness": {"endpoint": "drpc", "height": 1000, "how": "finalized the same block"},
+                                               "no_witness": [{"endpoint": "1rpc", "safe": 1050, "outcome": "error (RpcError)"}]})
     monkeypatch.setattr(reconcile, "RPC", {NET: "https://primary"})
     monkeypatch.delenv("SATLEDGER_RECONCILE_RPC", raising=False)
     monkeypatch.setenv("SATLEDGER_FINALITY_SAMPLE", "%s=https://drpc|https://base" % NET)
@@ -1669,3 +1671,40 @@ def test_the_witness_is_kept_in_the_history_record(monkeypatch, tmp_path):
     reconcile.main(["reconcile.py", str(log), "--history=%s" % history])
     record = json.loads(history.read_text().splitlines()[-1])
     assert record["endpoints"]["primary"]["witness"]["endpoint"] == "drpc"
+    assert record["endpoints"]["primary"]["no_witness"] == [{"endpoint": "1rpc", "safe": 1050, "outcome": "error (RpcError)"}], \
+        "a peer that fails run after run is visible across the history, by name"
+
+
+# ---- round twenty-seven: the failing side has a name, and two kinds of failure --------------
+
+def test_an_eligible_peer_that_errors_is_named_apart_from_one_with_no_block():
+    """minia2auk, round 27: a count says how many peers gave no block, not which; and an RPC
+    error (the peer is failing) and a successful answer without the block (pruned, or lagging
+    inside its own safe) say different things about the peer."""
+    fit = {"finalized_height": 1000, "finalized_hash": "0xa10", "host": "a"}
+    peers = {"https://broken": (1000, "0xa10"), "https://pruned": (990, "0x990"), "https://d": (1005, "0xa15")}
+
+    def header(url, height):
+        if url == "https://broken":
+            raise reconcile.RpcError(url, -32000, "upstream gone", 502)
+        if url == "https://pruned":
+            return None
+        return {1005: (1005, "0xa15", 0), 1000: (1000, "0xa10", 0), 990: (990, "0x990", 0)}.get(height)
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), header_fn=header,
+                                        sleep=lambda s: None, primary_url="https://a")
+    assert out["witness"] is None
+    assert out["no_witness"] == [{"endpoint": "broken", "safe": 1570, "outcome": "error (RpcError)"},
+                                 {"endpoint": "pruned", "safe": 1560, "outcome": "no block"}], out["no_witness"]
+    assert "(broken at safe 1570: error (RpcError); pruned at safe 1560: no block)" in out["line"], out["line"]
+    assert "upstream gone" not in out["line"] and "https://" not in out["line"], \
+        "only the error's class is kept: a message can carry an endpoint URL with a key in it"
+
+
+def test_the_default_reader_raises_on_an_rpc_failure_instead_of_reading_it_as_no_block(monkeypatch):
+    def failing(url, method, params):
+        raise reconcile.ChainUnavailable("%s: connection refused" % url)
+    monkeypatch.setattr(reconcile, "_rpc", failing)
+    with pytest.raises(reconcile.ChainUnavailable):
+        reconcile._header_at("https://peer", 1005)
+    monkeypatch.setattr(reconcile, "_rpc", lambda url, method, params: None)
+    assert reconcile._header_at("https://peer", 1005) is None

@@ -192,7 +192,8 @@ head cannot pose as a contradiction. A different hash is a contradiction;
 "no endpoint's safe head had reached N" and "K eligible endpoints did not
 answer" are stated apart. The witness is one source: its identity is on
 every height-bearing line, in the result (`witness`) and in the history
-record, and each contradiction names the role of each side (anchor,
+record, and so is every eligible endpoint that gave no block (`no_witness`,
+with its safe head and whether it errored or answered without one), and each contradiction names the role of each side (anchor,
 witness, finalized claim, anchor witnessed or unwitnessed), so a later
 audit can tell one unverified source from two independent ones. Re-reading the anchor from its own
 endpoint was rejected: that is self-consistency, which a liar with a
@@ -596,6 +597,15 @@ def _header_tuple(url: str, tag: str) -> Optional[Tuple[int, str, Optional[int]]
     return _int_hex(header.get("number")), (header.get("hash") or "").lower(), _int_hex(header.get("timestamp"))
 
 
+def _header_at(url: str, height: int) -> Optional[Tuple[int, str, Optional[int]]]:
+    """The block header at a height, None when the endpoint answers that it has
+    none; an RPC failure raises, so a broken peer is never read as a lagging one."""
+    header = _rpc(url, "eth_getBlockByNumber", [hex(height), False])
+    if not isinstance(header, dict) or _int_hex(header.get("number")) is None:
+        return None
+    return _int_hex(header.get("number")), (header.get("hash") or "").lower(), _int_hex(header.get("timestamp"))
+
+
 def endpoint_finality(url: str) -> Optional[Dict[str, Any]]:
     """The endpoint's own `latest`, `safe` and `finalized` headers as (number,
     hash, timestamp), or None for a tag it will not answer."""
@@ -604,6 +614,17 @@ def endpoint_finality(url: str) -> Optional[Dict[str, Any]]:
 
 #: Seconds to wait before re-reading peers when the primary is ahead of all of them.
 CROSS_RETRY_SECONDS = 10
+
+
+def _ask(header_fn, url: str, height: int) -> Tuple[str, str]:
+    """(hash or "", outcome): "block", "no block", or "error (<kind>)". Only the
+    exception's class is kept - its message can carry an endpoint URL with a key."""
+    try:
+        got = header_fn(url, height)
+    except Exception as exc:
+        return "", "error (%s)" % type(exc).__name__
+    theirs = ((got or (None, None, None))[1] or "").lower()
+    return theirs, "block" if theirs else "no block"
 
 
 def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, Optional[int]]],
@@ -625,13 +646,19 @@ def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, O
     A height that is not answered is not compared and is returned as such:
     the finding is a contradiction, never an absence.
 
+    An eligible endpoint that gives no block is named with its outcome:
+    an error (the endpoint is failing) and an answer without a block (pruned,
+    or lagging inside its own safe head) are different facts about the peer,
+    and the same name failing run after run is an operator signal.
+
     Returns {"contradictions": [{"height", "text", "sides": [{"hash", "at",
-    "role"}, ...]}], "not_compared": [heights], "witness": {"endpoint",
-    "height", "how"} or None, "unwitnessed": reason or None, "anchor":
-    {"height", "at"}}."""
+    "role"}, ...]}], "not_compared": [heights], "not_compared_detail":
+    [{"height", "endpoint", "outcome"}], "witness": {"endpoint", "height",
+    "how"} or None, "no_witness": [{"endpoint", "safe", "outcome"}],
+    "unwitnessed": reason or None, "anchor": {"height", "at"}}."""
     claims = [c for c in claims if c[3]]
-    result: Dict[str, Any] = {"contradictions": [], "not_compared": [], "witness": None, "unwitnessed": None,
-                              "anchor": None}
+    result: Dict[str, Any] = {"contradictions": [], "not_compared": [], "not_compared_detail": [], "witness": None,
+                              "no_witness": [], "unwitnessed": None, "anchor": None}
     by_height: Dict[int, List[Tuple[str, Optional[str], int, str, Optional[int]]]] = {}
     for c in claims:
         by_height.setdefault(c[2], []).append(c)
@@ -656,8 +683,9 @@ def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, O
         eligible = sorted((c for c in claims if c[2] != top and c[1] and c[4] is not None and c[4] >= top),
                           key=lambda c: -c[4])
         for c in eligible:
-            theirs = ((header_fn(c[1], top) or (None, None, None))[1] or "").lower()
+            theirs, outcome = _ask(header_fn, c[1], top)
             if not theirs:
+                result["no_witness"].append({"endpoint": c[0], "safe": c[4], "outcome": outcome})
                 continue
             if theirs != anchors[0][3]:
                 result["contradictions"].append({
@@ -670,7 +698,9 @@ def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, O
             break
         else:
             result["unwitnessed"] = ("no other endpoint's safe head had reached %d" % top if not eligible else
-                                     "%d endpoint(s) whose safe head had reached %d did not answer" % (len(eligible), top))
+                                     "%d endpoint(s) whose safe head had reached %d gave no block there (%s)" % (
+                                         len(eligible), top, "; ".join("%s at safe %d: %s" % (
+                                             w["endpoint"], w["safe"], w["outcome"]) for w in result["no_witness"])))
     asker = next((c for c in anchors if c[1]), None)
     lower = sorted(n for n in by_height if n != top)
     if asker is None:
@@ -683,9 +713,10 @@ def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, O
         other = anchors[0][0]
     vouched = "anchor, witnessed by %s" % other if other else "anchor, unwitnessed"
     for n in lower:
-        theirs = ((header_fn(asker[1], n) or (None, None, None))[1] or "").lower()
+        theirs, outcome = _ask(header_fn, asker[1], n)
         if not theirs:
             result["not_compared"].append(n)
+            result["not_compared_detail"].append({"height": n, "endpoint": asker[0], "outcome": outcome})
         elif theirs != by_height[n][0][3]:
             at = [c[0] for c in by_height[n]]
             result["contradictions"].append({
@@ -701,7 +732,7 @@ def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None,
     """Compare the primary's finalized block with peer endpoints; see the module docstring."""
     import time
     finality_fn = finality_fn or endpoint_finality
-    header_fn = header_fn or (lambda url, height: _header_tuple(url, hex(height)))
+    header_fn = header_fn or _header_at
     sleep = sleep or time.sleep
     height, block_hash = fit.get("finalized_height"), (fit.get("finalized_hash") or "").lower()
     out = {"peers": len(peers), "answered": 0, "smell": False, "line": ""}
@@ -763,7 +794,11 @@ def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None,
     # The witness travels with every verdict, so an audit can tell one unverified
     # source from two independent ones without reading this file.
     out["witness"], out["contradictions"] = hashes["witness"], hashes["contradictions"]
+    out["no_witness"] = hashes["no_witness"]
     chain = ("every finalized hash lies on one chain" if not unasked else
+             "no finalized hashes contradict; not compared at height(s) %s" % ", ".join(
+                 "%d (%s: %s)" % (d["height"], d["endpoint"], d["outcome"]) for d in hashes["not_compared_detail"])
+             if hashes["not_compared_detail"] else
              "no finalized hashes contradict; not compared at height(s) %s" % ", ".join(map(str, unasked)))
     if hashes["anchor"]:
         anchor = "%d at %s" % (hashes["anchor"]["height"], ", ".join(hashes["anchor"]["at"]))
@@ -2102,7 +2137,7 @@ def main(argv: List[str]) -> int:
             f["cross"] = "" if f["smell"] else "single endpoint: a clamp just below an honest safe is not checkable"
             continue
         cross = endpoint_crosscheck(f, peers, primary_url=RPC[f["network"]])
-        f["cross"], f["witness"] = cross["line"], cross.get("witness")
+        f["cross"], f["witness"], f["no_witness"] = cross["line"], cross.get("witness"), cross.get("no_witness")
         if cross["smell"]:
             f["smell"], f["reason"] = True, cross["line"]
     smelly = {f["network"] for f in fitness if f["smell"]}
@@ -2123,7 +2158,7 @@ def main(argv: List[str]) -> int:
         record["endpoints"] = {f["host"]: {"depth_blocks": f["depth_blocks"], "depth_s": f["depth_s"],
                                            "safe_depth_blocks": f["safe_depth_blocks"],
                                            "finalized_height": f["finalized_height"], "smell": f["smell"],
-                                           "witness": f.get("witness")}
+                                           "witness": f.get("witness"), "no_witness": f.get("no_witness") or []}
                                for f in fitness}
         with open(history, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
