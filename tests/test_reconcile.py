@@ -378,6 +378,10 @@ def test_transfers_in_tx_distinguishes_no_receipt_from_no_transfer(monkeypatch):
             return None if params[0] == "0xmempool" else {"logs": []}
         if method == "eth_blockNumber":
             return hex(1000)
+        if method == "eth_getBlockByNumber":
+            # The finalized head; answered here so this test does not depend
+            # on another test having filled the module's finality cache.
+            return {"number": hex(900), "hash": "0x" + "f9" * 32}
         raise AssertionError(method)
     monkeypatch.setattr(reconcile, "_rpc", rpc)
     assert reconcile.transfers_in_tx(NET, ASSET, PAYER, "0xmempool") is None
