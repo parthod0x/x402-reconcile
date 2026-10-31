@@ -173,9 +173,10 @@ freshest peer lagging one step; so is an honest primary whose freshest
 peer lags two steps, which reads as a clamp - loud, and the per-peer
 triples show whether the whole set is stale (one provider's cache under
 several names). The midpoint is the threshold rather than a third of the
-gap: Base's gap swings between ~380 and ~630 blocks with the finality
-sawtooth, so a third falls to ~130 and calls the measured honest lead of
-186 a clamp.
+gap: Base's gap rides the finality sawtooth (observed 31 Oct: finalized
+519-705 blocks behind latest, safe 45-60 behind, so ~470-650), and a
+third of the low end is ~155, which calls the measured honest lead of 186
+a clamp. Half of it is ~235: the honest margin is real but not wide.
 What this cannot see: a majority of the sample agreeing on the same wrong
 answer, peers that are one backend under several names (two public Base
 endpoints return identical answers to the hash, which is a hint of a
