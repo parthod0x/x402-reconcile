@@ -1315,17 +1315,72 @@ def test_quota_and_transient_both_count_as_unmeasured_and_name_themselves():
 
 # ---- round nineteen: compare endpoints, not constants ----------------------------------------
 
-def _peers(table):
-    """table: {url: (finalized_height, hash)}; header_fn answers hash at a height from `at`."""
-    return lambda url: {"finalized": (table[url][0], table[url][1], 0)} if url in table else None
+def _peers(table, safe_depth=None, latest_depth=None):
+    """table: {url: (finalized_height, hash)}; each peer's safe and latest sit the given depth above it."""
+    def heads(url):
+        if url not in table:
+            return None
+        n, h = table[url]
+        got = {"finalized": (n, h, 0)}
+        if safe_depth is not None:
+            got["safe"] = (n + safe_depth, "0xsafe", 0)
+        if latest_depth is not None:
+            got["latest"] = (n + latest_depth, "0xtip", 0)
+        return got
+    return heads
 
 
-def test_a_clamp_lands_where_no_peer_has_finalized_anything():
-    fit = {"finalized_height": 53274500, "finalized_hash": "0xclamp"}
+def test_a_clamp_just_below_safe_leads_by_most_of_the_gap():
+    """Peers' finalized is ~570 below their safe; the clamp sits one block under safe."""
+    fit = {"finalized_height": 53274399 + 569, "finalized_hash": "0xclamp"}
     peers = {"https://a": (53274399, "0x48fd"), "https://b": (53274228, "0xb9fe"), "https://c": (53272688, "0x4749")}
     slept = []
-    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers), sleep=slept.append)
-    assert out["smell"] is True and "no independent endpoint has finalized it" in out["line"] and slept == [10]
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), sleep=slept.append)
+    assert out["smell"] is True and "a clamp" in out["line"] and slept == [10]
+    assert "re-read 10 s later" in out["line"]
+
+
+def test_an_honest_lead_of_one_finality_step_is_drift_not_a_clamp():
+    """Live, 31 Oct: mainnet.base.org led blastapi by 186 blocks for about 290 s, and every
+    other peer alternated between the two heights. Ten seconds does not separate that from a
+    clamp; the size of the lead against the peers' own gap does."""
+    fit = {"finalized_height": 53317988, "finalized_hash": "0xnew"}
+    peers = {"https://publicnode": (53317802, "0xold"), "https://blast": (53317802, "0xold"),
+             "https://1rpc": (53316253, "0xolder")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), sleep=lambda s: None)
+    assert out["smell"] is False and "drift, not a clamp" in out["line"] and "leads every peer by 186" in out["line"]
+
+
+def test_a_finalized_block_above_every_peer_tip_is_fabricated():
+    fit = {"finalized_height": 2000, "finalized_hash": "0xfuture"}
+    peers = {"https://a": (1000, "0xa"), "https://b": (990, "0xb")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), sleep=lambda s: None)
+    assert out["smell"] is True and "no independent endpoint has produced" in out["line"]
+
+
+def test_a_lead_with_no_safe_to_size_it_is_stated_not_judged():
+    fit = {"finalized_height": 1500, "finalized_hash": "0xmine"}
+    peers = {"https://a": (1000, "0xa"), "https://b": (990, "0xb")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers), sleep=lambda s: None)
+    assert out["smell"] is False and "not judged" in out["line"]
+
+
+def test_quorum_is_required_of_the_re_read_the_verdict_rests_on():
+    """minia2auk, round 20: read 1 a=900 b=950, read 2 a=980 b=None. The re-read
+    has one peer, so it is no quorum - not a clamp, and not the first read reused."""
+    fit = {"finalized_height": 1000, "finalized_hash": "0xmine"}
+    reads = iter([{"https://a": (900, "0xa"), "https://b": (950, "0xb")}, {"https://a": (980, "0xa")}])
+    current = {}
+
+    def heads(url):
+        return _peers(current, 570, 620)(url)
+
+    def sleep(seconds):
+        current.clear()
+        current.update(next(reads))
+    current.update(next(reads))
+    out = reconcile.endpoint_crosscheck(fit, ["https://a", "https://b"], finality_fn=heads, sleep=sleep)
+    assert out["smell"] is False and "answered the re-read; no quorum" in out["line"] and out["answered"] == 1
 
 
 def test_drift_is_not_a_clamp_and_hashes_decide_at_one_height():
