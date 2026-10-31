@@ -1348,7 +1348,7 @@ def test_an_honest_lead_of_one_finality_step_is_drift_not_a_clamp():
     peers = {"https://publicnode": (53317802, "0xold"), "https://blast": (53317802, "0xold"),
              "https://1rpc": (53316253, "0xolder")}
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), sleep=lambda s: None)
-    assert out["smell"] is False and "drift, not a clamp" in out["line"] and "by 186 blocks" in out["line"]
+    assert out["smell"] is False and "drift, not a clamp" in out["line"] and "leads the field by 186" in out["line"]
     assert "publicnode (53317802, 53318372, 53318422)" in out["line"], "each peer's triple is printed"
 
 
@@ -1382,6 +1382,7 @@ def test_quorum_is_required_of_the_re_read_the_verdict_rests_on():
     current.update(next(reads))
     out = reconcile.endpoint_crosscheck(fit, ["https://a", "https://b"], finality_fn=heads, sleep=sleep)
     assert out["smell"] is False and "answered the re-read stably; no quorum" in out["line"] and out["answered"] == 1
+    assert "unstable, dropped: b (950 -> no answer)" in out["line"], "the peer that left is named"
 
 
 def _scripted(reads):
@@ -1415,7 +1416,9 @@ def test_the_gap_never_pairs_one_peers_safe_with_anothers_finalized():
     heads, sleep = _scripted([read, read])
     out = reconcile.endpoint_crosscheck({"finalized_height": 1010, "finalized_hash": "0x"}, list(read),
                                         finality_fn=heads, sleep=sleep)
-    assert out["smell"] is False and "leads a by 110 blocks" in out["line"] and "gap of 300" in out["line"]
+    # minia2auk, round 22: 5 ahead of the field and 110 into a's ladder are two findings
+    assert out["smell"] is False and "leads the field by 5 (highest peer finalized 1005 at b)" in out["line"]
+    assert "110 into a's ladder (900, 1200)" in out["line"] and "gap of 300" in out["line"]
 
 
 def test_a_peer_whose_finalized_goes_backwards_is_dropped_by_name():
@@ -1456,4 +1459,18 @@ def test_fewer_than_two_peers_is_no_quorum_not_a_verdict():
     out = reconcile.endpoint_crosscheck(fit, ["https://a", "https://b"], finality_fn=_peers({"https://a": (900, "0x")}),
                                         sleep=lambda s: None)
     assert out["smell"] is False and "no quorum" in out["line"]
+
+
+def test_the_ladder_is_the_freshest_not_the_one_behind_with_the_top_safe():
+    """minia2auk, round 22: ranking by finalized + safe (= 2*finalized + gap) let a peer behind
+    on finalized but carrying a higher safe size the bar. Safe cannot pass the tip, so the stale
+    peer wins only while it lags by less than the fresh peer's safe-to-tip distance: the effect
+    is small, and real at the boundary. Here 1293 is past fresh's midpoint (1290) and short of
+    stale's (1295), so the old key called a clamp drift."""
+    read = {"https://fresh": {"finalized": 1000, "safe": 1580, "latest": 1630},
+            "https://stale": {"finalized": 960, "safe": 1630, "latest": 1630}}
+    heads, sleep = _scripted([read, read])
+    out = reconcile.endpoint_crosscheck({"finalized_height": 1293, "finalized_hash": "0x"}, list(read),
+                                        finality_fn=heads, sleep=sleep)
+    assert out["smell"] is True and "293 into fresh's ladder (1000, 1580)" in out["line"], out["line"]
 
