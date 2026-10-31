@@ -1330,12 +1330,17 @@ def _peers(table, safe_depth=None, latest_depth=None):
     return heads
 
 
+def _silent(url, height):
+    """header_fn for an endpoint that answers no height: nothing is witnessed or compared."""
+    return None
+
+
 def test_a_clamp_just_below_safe_leads_by_most_of_the_gap():
     """Peers' finalized is ~570 below their safe; the clamp sits one block under safe."""
     fit = {"finalized_height": 53274399 + 569, "finalized_hash": "0xclamp"}
     peers = {"https://a": (53274399, "0x48fd"), "https://b": (53274228, "0xb9fe"), "https://c": (53272688, "0x4749")}
     slept = []
-    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), sleep=slept.append)
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), header_fn=_silent, sleep=slept.append)
     assert out["smell"] is True and "a clamp" in out["line"] and slept == [10]
     assert "re-read 10 s later" in out["line"]
 
@@ -1347,7 +1352,7 @@ def test_an_honest_lead_of_one_finality_step_is_drift_not_a_clamp():
     fit = {"finalized_height": 53317988, "finalized_hash": "0xnew"}
     peers = {"https://publicnode": (53317802, "0xold"), "https://blast": (53317802, "0xold"),
              "https://1rpc": (53316253, "0xolder")}
-    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), sleep=lambda s: None)
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), header_fn=_silent, sleep=lambda s: None)
     assert out["smell"] is False and "drift, not a clamp" in out["line"] and "leads the field by 186" in out["line"]
     assert "publicnode (53317802, 53318372, 53318422)" in out["line"], "each peer's triple is printed"
 
@@ -1355,14 +1360,14 @@ def test_an_honest_lead_of_one_finality_step_is_drift_not_a_clamp():
 def test_a_finalized_block_above_every_peer_tip_is_fabricated():
     fit = {"finalized_height": 2000, "finalized_hash": "0xfuture"}
     peers = {"https://a": (1000, "0xa"), "https://b": (990, "0xb")}
-    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), sleep=lambda s: None)
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), header_fn=_silent, sleep=lambda s: None)
     assert out["smell"] is True and "no independent endpoint has produced" in out["line"]
 
 
 def test_a_lead_with_no_safe_to_size_it_is_stated_not_judged():
     fit = {"finalized_height": 1500, "finalized_hash": "0xmine"}
     peers = {"https://a": (1000, "0xa"), "https://b": (990, "0xb")}
-    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers), sleep=lambda s: None)
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers), header_fn=_silent, sleep=lambda s: None)
     assert out["smell"] is False and "not judged" in out["line"]
 
 
@@ -1409,13 +1414,13 @@ def test_the_gap_never_pairs_one_peers_safe_with_anothers_finalized():
             "https://b": {"finalized": 1005, "safe": None, "latest": 1060}}
     heads, sleep = _scripted([read, read])
     out = reconcile.endpoint_crosscheck({"finalized_height": 1010, "finalized_hash": "0x"}, list(read),
-                                        finality_fn=heads, sleep=sleep)
+                                        finality_fn=heads, header_fn=_silent, sleep=sleep)
     # B has finalized past A's safe, so A's ladder is stale and sizes nothing
     assert out["smell"] is False and "not judged" in out["line"] and "b (1005, None, 1060)" in out["line"]
     read["https://a"]["safe"] = 1200
     heads, sleep = _scripted([read, read])
     out = reconcile.endpoint_crosscheck({"finalized_height": 1010, "finalized_hash": "0x"}, list(read),
-                                        finality_fn=heads, sleep=sleep)
+                                        finality_fn=heads, header_fn=_silent, sleep=sleep)
     # minia2auk, round 22: 5 ahead of the field and 110 into a's ladder are two findings
     assert out["smell"] is False and "leads the field by 5 (highest peer finalized 1005 at b)" in out["line"]
     assert "110 into a's ladder (900, 1200)" in out["line"] and "gap of 300" in out["line"]
@@ -1429,7 +1434,7 @@ def test_a_peer_whose_finalized_goes_backwards_is_dropped_by_name():
     second = dict(first, **{"https://publicnode": {"finalized": 53317802, "safe": 53318560, "latest": 53318610}})
     heads, sleep = _scripted([first, second])
     out = reconcile.endpoint_crosscheck({"finalized_height": 53317990, "finalized_hash": "0x"}, list(first),
-                                        finality_fn=heads, sleep=sleep)
+                                        finality_fn=heads, header_fn=_silent, sleep=sleep)
     assert "unstable, dropped: publicnode (53317988 -> 53317802)" in out["line"]
     assert out["answered"] == 2 and out["smell"] is False
 
@@ -1484,7 +1489,7 @@ def test_the_ladder_is_the_freshest_not_the_one_behind_with_the_top_safe():
             "https://stale": {"finalized": 960, "safe": 1630, "latest": 1630}}
     heads, sleep = _scripted([read, read])
     out = reconcile.endpoint_crosscheck({"finalized_height": 1293, "finalized_hash": "0x"}, list(read),
-                                        finality_fn=heads, sleep=sleep)
+                                        finality_fn=heads, header_fn=_silent, sleep=sleep)
     assert out["smell"] is True and "293 into fresh's ladder (1000, 1580)" in out["line"], out["line"]
 
 
@@ -1524,11 +1529,13 @@ def test_a_leading_primary_is_asked_for_the_peers_finalized_blocks():
     peers = {"https://publicnode": (53317802, "0xold"), "https://blast": (53317802, "0xold"),
              "https://1rpc": (53316253, "0xolder")}
     calls = []
-    honest = _finalized_chain({53317802: "0xold", 53316253: "0xolder"}, calls)
+    honest = _finalized_chain({53317988: "0xnew", 53317802: "0xold", 53316253: "0xolder"}, calls)
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), header_fn=honest,
                                         sleep=lambda s: None, primary_url="https://primary")
     assert out["smell"] is False and "drift, not a clamp" in out["line"]
-    assert sorted(calls) == [("https://primary", 53316253), ("https://primary", 53317802)], "one call per lower height"
+    assert "its top block 53317988 witnessed by publicnode" in out["line"], out["line"]
+    assert sorted(calls) == [("https://primary", 53316253), ("https://primary", 53317802),
+                             ("https://publicnode", 53317988)], "one witness call, then one call per lower height"
     forked = _finalized_chain({53317802: "0xfork", 53316253: "0xolder"})
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), header_fn=forked,
                                         sleep=lambda s: None, primary_url="https://primary")
@@ -1543,3 +1550,51 @@ def test_a_height_the_highest_claimant_does_not_answer_is_not_a_contradiction():
                                         header_fn=lambda url, h: None, sleep=lambda s: None)
     assert out["smell"] is False and "undetermined" not in out["line"]
     assert "not compared at height(s) 900, 1000" in out["line"], "an absence is stated, not passed off as agreement"
+
+
+# ---- round twenty-five: the anchor is a claim with a witness, not an assumption -------------
+
+def _per_endpoint(chains):
+    """header_fn serving each url its own chain: {url: {height: hash}}."""
+    return lambda url, height: (height, chains[url][height], 0) if height in chains.get(url, {}) else None
+
+
+def test_an_invented_top_claim_below_another_peers_tip_is_contradicted_by_a_witness():
+    """minia2auk, round 25: A, B, C honest at 1000 / 1002 / 1005; D claims 1008 with an invented
+    hash and answers lower heights from its real chain; E is honest, finalized 1005, tip 1010.
+    Fabricated-first does not fire (1008 is below E's tip), and every comparison was made
+    against D - the one value that met no second source. The run printed "every finalized
+    hash lies on one chain"."""
+    real = {1000: "0xa10", 1002: "0xa12", 1005: "0xa15", 1008: "0xa18"}
+    fit = {"finalized_height": 1000, "finalized_hash": "0xa10", "host": "a"}
+    peers = {"https://b": (1002, "0xa12"), "https://c": (1005, "0xa15"), "https://d": (1008, "0xd18"),
+             "https://e": (1005, "0xa15")}
+    chains = {url: real for url in peers}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 5), header_fn=_per_endpoint(chains),
+                                        sleep=lambda s: None, primary_url="https://a")
+    assert out["smell"] is True and out["undetermined"] is True, out["line"]
+    assert "height 1008: 0xd18 at d vs 0xa18 on c's chain" in out["line"], out["line"]
+
+
+def test_a_top_claim_nobody_else_reports_is_stated_unwitnessed():
+    """No other endpoint has the anchor's block yet: an absence, stated on the line, not passed
+    off as one chain and not called a contradiction."""
+    real = {1000: "0xa10", 1005: "0xa15"}
+    fit = {"finalized_height": 1000, "finalized_hash": "0xa10", "host": "a"}
+    peers = {"https://b": (1000, "0xa10"), "https://d": (1005, "0xa15")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
+                                        header_fn=_per_endpoint({"https://b": {1000: "0xa10"}, "https://d": real}),
+                                        sleep=lambda s: None, primary_url="https://a")
+    assert out["smell"] is False
+    assert "the top claim (1005 at d) has no second witness, so the chain it anchors is unconfirmed" in out["line"], out["line"]
+
+
+def test_two_claims_at_the_top_witness_each_other_without_a_call():
+    real = {1000: "0xa10", 1005: "0xa15"}
+    calls = []
+    fit = {"finalized_height": 1000, "finalized_hash": "0xa10", "host": "a"}
+    peers = {"https://c": (1005, "0xa15"), "https://d": (1005, "0xa15")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
+                                        header_fn=_finalized_chain(real, calls), sleep=lambda s: None, primary_url="https://a")
+    assert out["smell"] is False and "its top block 1005 witnessed by d" in out["line"], out["line"]
+    assert all(h != 1005 for _, h in calls), "the witness cost no call"
