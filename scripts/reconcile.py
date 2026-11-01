@@ -205,11 +205,20 @@ domains, and one domain can front several operators. The two directions are
 not equal: a shared hint is evidence of dependence, a different hint is only
 the absence of a warning - resold capacity, a CDN in front of one origin or a
 front end on a provider's gateway all give unrelated names to one backend - so
-nothing counts a mismatch as a second source. Each hint carries its basis
-(host, suffix assumed, rule), so a suffix the short list lacks shows on the
-row instead of silently splitting one operator. The hint is co-tenancy of a
-name, not a failure domain: an anycast name spans nodes that fail apart, and
-shared failure in time is what the run history records. Re-reading the anchor from its own
+nothing counts a mismatch as a second source. The registrable domain comes
+from the Public Suffix List, shipped beside this file with its version on
+every hint, so multi-tenant suffixes (ltd.uk, workers.dev, github.io,
+s3.amazonaws.com) split their tenants instead of merging them; a host no rule
+covers is `unknown-suffix` and keeps its whole name, never a guessed merge
+key. Each hint carries its basis (host, suffix, rule, list version) on the
+row. The hint is co-tenancy of a name, not a failure domain: an anycast name
+spans nodes that fail apart. No shared-failure grouping is computed. One that
+is must count per pair the reads where both were eligible and one was asked,
+the reads where both failed, and the reads where one did - (eligible_n,
+failed_together_n, one_failed_n) - and leave a pair it cannot separate
+`unknown`, never `independent`: two peers each asked twice look perfectly
+correlated, and absence of correlation, like a different hint, is not
+evidence of separation. Re-reading the anchor from its own
 endpoint was rejected: that is self-consistency, which a liar with a
 consistent local view passes, not corroboration. Attribution is
 asymmetric and the line does not resolve it: "X at b vs Y on a's chain"
@@ -281,8 +290,11 @@ which is checked as *strict* increase - a log repeated at the same pair is
 a duplicate that would inflate a sum into a surplus, so it is IncompleteRead,
 inside a page and across the whole walk. Logs a provider returns outside the
 range asked for are dropped from that page (the page that owns their block
-returns them), and every remaining dedupe is on (blockHash, logIndex), never
-on blockNumber, which would merge two branches.
+returns them), and counted: the read's metadata names each page that
+dropped any (`outside_range_dropped`), because answering wider than asked is
+a property of the provider, and the drop is the only place it shows. Every
+remaining dedupe is on (blockHash, logIndex), never on blockNumber, which
+would merge two branches.
 
 Every range asked for is at most PAGE_BLOCKS blocks, and the last one ends
 exactly at the window's end, so an empty answer means "these blocks were
@@ -376,10 +388,12 @@ itself; 3 blind - not one row was measured. Nothing here signs or sends.
 
 from __future__ import annotations
 
+import functools
 import json
 import sys
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 MARKER = "x402-funnel "
@@ -1125,12 +1139,13 @@ def _tiled_blocks(url: str, address: str, topics: list, from_block: int, to_bloc
     """eth_getLogs over a block range in PAGE_BLOCKS pages that must tile it,
     completed from block receipts and checked for strict order."""
     found: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, int]] = []
     covered_to = from_block - 1
     for start in range(from_block, to_block + 1, PAGE_BLOCKS):
         end = min(start + PAGE_BLOCKS - 1, to_block)
         if start != covered_to + 1:
             raise IncompleteRead("pages do not tile the window at block %d" % start)
-        found.extend(_page(url, address, topics, start, end))
+        found.extend(_page(url, address, topics, start, end, dropped))
         covered_to = end
     if covered_to != to_block:
         raise IncompleteRead("window ends at block %d but the read stopped at %d" % (to_block, covered_to))
@@ -1141,7 +1156,8 @@ def _tiled_blocks(url: str, address: str, topics: list, from_block: int, to_bloc
     meta = {"from_block": from_block, "to_block": to_block, "head": head,
             "confirmed_depth": to_block <= head - CONFIRMATIONS,
             "finalized": _is_final(url, to_block), "rpc": _host(url),
-            "finalized_height": finality(url)[0], "finalized_hash": finality(url)[1]}
+            "finalized_height": finality(url)[0], "finalized_hash": finality(url)[1],
+            "outside_range_dropped": dropped}
     return found, meta
 
 
@@ -1150,10 +1166,69 @@ def _host(url: str) -> str:
     return urlparse(url).netloc or url
 
 
-# Second-level labels under which a registrable name takes three labels
-# (example.co.uk, example.com.au). A short list, not the Public Suffix List:
-# the hint groups endpoints for a reader, it does not establish identity.
-_SHARED_SECOND_LEVEL = {"ac", "co", "com", "edu", "gov", "ne", "net", "or", "org"}
+# The Mozilla Public Suffix List (MPL-2.0), unmodified, from
+# https://publicsuffix.org/list/public_suffix_list.dat. Refresh by replacing
+# the file; its VERSION line rides on every hint derived from it.
+PUBLIC_SUFFIX_LIST = Path(__file__).with_name("public_suffix_list.dat")
+
+
+def _ascii_name(name: str) -> Optional[str]:
+    labels = []
+    for label in name.split("."):
+        if label == "*" or label.isascii():
+            labels.append(label)
+            continue
+        try:
+            labels.append(label.encode("idna").decode("ascii"))
+        except UnicodeError:
+            return None
+    return ".".join(labels)
+
+
+@functools.lru_cache(maxsize=1)
+def _public_suffixes() -> Tuple[str, frozenset, frozenset, frozenset]:
+    """(version, rules, wildcard parents, exceptions); empty if the list is absent."""
+    try:
+        text = PUBLIC_SUFFIX_LIST.read_text(encoding="utf-8")
+    except OSError:
+        return "", frozenset(), frozenset(), frozenset()
+    version, rules, wildcards, exceptions = "", set(), set(), set()
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("// VERSION:"):
+            version = line.split(":", 1)[1].strip()
+        if not line or line.startswith("//"):
+            continue
+        rule = line.split()[0].lower()
+        exception = rule.startswith("!")
+        name = _ascii_name(rule.lstrip("!"))
+        if name is None:
+            continue
+        if exception:
+            exceptions.add(name)
+        elif name.startswith("*."):
+            wildcards.add(name[2:])
+        else:
+            rules.add(name)
+    return version, frozenset(rules), frozenset(wildcards), frozenset(exceptions)
+
+
+def _public_suffix(labels: List[str]) -> Optional[str]:
+    """The public suffix of a host by the list's algorithm, or None if no rule covers it.
+
+    An exception rule prevails and its suffix is the rule less its first
+    label; otherwise the longest matching rule, a wildcard matching one
+    label. The list's implicit `*` (any unlisted TLD is a suffix) is not
+    applied: that case is reported as unknown rather than derived.
+    """
+    _, rules, wildcards, exceptions = _public_suffixes()
+    for i in range(len(labels)):
+        if ".".join(labels[i:]) in exceptions:
+            return ".".join(labels[i + 1:])
+    for i in range(len(labels)):
+        if ".".join(labels[i:]) in rules or (i + 1 < len(labels) and ".".join(labels[i + 1:]) in wildcards):
+            return ".".join(labels[i:])
+    return None
 
 
 def operator_hint(endpoint: str) -> str:
@@ -1173,12 +1248,14 @@ def operator_hint(endpoint: str) -> str:
 
 
 def operator_hint_basis(endpoint: str) -> Dict[str, str]:
-    """The hint with what it was computed from: {"hint", "host", "suffix", "rule"}.
+    """The hint with what it was computed from: {"hint", "host", "suffix", "rule"},
+    plus "list" (the Public Suffix List version) when the list decided it.
 
-    The suffix list is short, and it is applied to hostnames nobody here
-    chose, so a suffix it lacks splits or merges operators without any sign
-    in the record. Carrying the host, the suffix assumed and the rule used
-    makes such a miss readable on the row.
+    Rules: `public suffix list`; `host is a public suffix`; `unknown-suffix`
+    (no rule covers the host, or the list is absent - the hint is then the
+    whole host, so nothing is merged on a guess); `ip literal`; `single
+    label`. A fallback that looks like a rule would turn a known unknown into
+    a confident merge key that everything grouping on the hint inherits.
     """
     host = endpoint.rsplit("@", 1)[-1].lower()
     if host.startswith("["):
@@ -1190,12 +1267,14 @@ def operator_hint_basis(endpoint: str) -> Dict[str, str]:
         return {"hint": host, "host": host, "suffix": "", "rule": "ip literal"}
     if len(labels) == 1:
         return {"hint": host, "host": host, "suffix": "", "rule": "single label"}
-    if len(labels) == 2:
-        return {"hint": host, "host": host, "suffix": labels[-1], "rule": "whole host"}
-    if labels[-2] in _SHARED_SECOND_LEVEL and len(labels[-1]) == 2:
-        return {"hint": ".".join(labels[-3:]), "host": host, "suffix": ".".join(labels[-2:]),
-                "rule": "shared second level"}
-    return {"hint": ".".join(labels[-2:]), "host": host, "suffix": labels[-1], "rule": "last two labels"}
+    suffix = _public_suffix(labels)
+    if suffix is None:
+        return {"hint": host, "host": host, "suffix": "", "rule": "unknown-suffix"}
+    version = _public_suffixes()[0]
+    if suffix == host:
+        return {"hint": host, "host": host, "suffix": suffix, "rule": "host is a public suffix", "list": version}
+    registrable = ".".join(labels[-(suffix.count(".") + 2):])
+    return {"hint": registrable, "host": host, "suffix": suffix, "rule": "public suffix list", "list": version}
 
 
 def _strictly_increasing(logs: List[Dict[str, Any]], where: str) -> None:
@@ -1220,7 +1299,8 @@ def _index_of(log: Dict[str, Any]) -> int:
         return -1
 
 
-def _page(url: str, address: str, topics: list, start: int, end: int) -> List[Dict[str, Any]]:
+def _page(url: str, address: str, topics: list, start: int, end: int,
+          dropped: Optional[List[Dict[str, int]]] = None) -> List[Dict[str, Any]]:
     """One eth_getLogs range, followed past the last block it reached.
 
     A capped answer is a prefix: it stops at some block B and drops
@@ -1245,13 +1325,17 @@ def _page(url: str, address: str, topics: list, start: int, end: int) -> List[Di
         raise IncompleteRead("blocks %d..%d returned no list (%r)" % (start, end, type(logs).__name__))
     # Providers return logs outside the asked range (inclusive ends, cached
     # wider spans). Those belong to the page that owns their block, which
-    # returns them too; kept here they would be counted twice.
-    logs = [l for l in logs if start <= _block_of(l) <= end]
+    # returns them too; kept here they would be counted twice. How many were
+    # dropped is recorded: it describes the provider, and nowhere else shows it.
+    inside = [l for l in logs if start <= _block_of(l) <= end]
+    if dropped is not None and len(inside) != len(logs):
+        dropped.append({"from_block": start, "to_block": end, "dropped": len(logs) - len(inside)})
+    logs = inside
     _strictly_increasing(logs, "blocks %d..%d" % (start, end))
     if logs and _block_of(logs[-1]) < end:
         # A capped answer stops at some block: read what follows as its own
         # bounded range (never wider than this page, ending exactly at its end).
-        logs = logs + _page(url, address, topics, _block_of(logs[-1]) + 1, end)
+        logs = logs + _page(url, address, topics, _block_of(logs[-1]) + 1, end, dropped)
     return logs
 
 

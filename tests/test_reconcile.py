@@ -868,8 +868,11 @@ def test_logs_outside_the_asked_range_are_dropped_not_counted_twice(monkeypatch)
     ev = _event_log(nonce, "0xa", 1150)
     rpc, _ = _rpc_table({(1000, 1099): [ev], (1100, 1199): [ev], (1200, 1250): []}, head=1250)
     monkeypatch.setattr(reconcile, "_rpc", rpc)
-    logs, _ = reconcile._tiled_blocks(reconcile.RPC[NET], ASSET, [[reconcile.AUTH_USED_TOPIC]], 1000, 1250, 1250)
+    logs, meta = reconcile._tiled_blocks(reconcile.RPC[NET], ASSET, [[reconcile.AUTH_USED_TOPIC]], 1000, 1250, 1250)
     assert len(logs) == 1
+    # minia2auk, round 30: answering wider than asked is a property of the provider, and the
+    # drop is the only place it shows - so it is counted, per page.
+    assert meta["outside_range_dropped"] == [{"from_block": 1000, "to_block": 1099, "dropped": 1}]
 
 
 def test_every_range_asked_for_is_bounded_and_the_last_ends_at_the_window(monkeypatch):
@@ -1778,12 +1781,10 @@ def test_every_hint_carries_its_basis_so_a_missing_suffix_shows_on_the_row():
     miss is readable: here `ltd.uk` is not in the list, so two unrelated companies under it
     share the hint `ltd.uk` - and the row says the rule was `last two labels`, suffix `uk`."""
     basis = reconcile.operator_hint_basis
+    version = reconcile._public_suffixes()[0]
     assert basis("base-mainnet.g.alchemy.com") == {"hint": "alchemy.com", "host": "base-mainnet.g.alchemy.com",
-                                                   "suffix": "com", "rule": "last two labels"}
-    assert basis("rpc.example.co.uk")["rule"] == "shared second level"
+                                                   "suffix": "com", "rule": "public suffix list", "list": version}
     assert basis("rpc.example.co.uk")["suffix"] == "co.uk"
-    missed = basis("rpc.acme.ltd.uk")
-    assert missed["hint"] == "ltd.uk" and missed["suffix"] == "uk" and missed["rule"] == "last two labels"
     assert basis("203.0.113.7:8545")["rule"] == basis("[2001:db8::1]")["rule"] == "ip literal"
 
     real = {1000: "0xa10", 1005: "0xa15"}
@@ -1791,10 +1792,11 @@ def test_every_hint_carries_its_basis_so_a_missing_suffix_shows_on_the_row():
     peers = {"https://b.drpc.org": (1005, "0xa15"), "https://c.blast.io": (1000, "0xbad")}
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
                                         header_fn=_finalized_chain(real), sleep=lambda s: None)
-    assert out["witness"]["operator_hint_basis"] == {"host": "b.drpc.org", "suffix": "org", "rule": "last two labels"}
+    assert out["witness"]["operator_hint_basis"] == {"host": "b.drpc.org", "suffix": "org",
+                                                     "rule": "public suffix list", "list": version}
     sides = out["contradictions"][0]["sides"]
     assert sides[0]["operator_hint_bases"] == {"c.blast.io": {"host": "c.blast.io", "suffix": "io",
-                                                              "rule": "last two labels"}}
+                                                              "rule": "public suffix list", "list": version}}
 
 
 def test_a_different_hint_is_the_absence_of_a_warning_not_a_second_source():
@@ -1814,3 +1816,54 @@ def test_a_different_hint_is_the_absence_of_a_warning_not_a_second_source():
     assert "possibly one source" in shared["line"]
     assert "possibly one source" not in apart["line"]
     assert "independent" not in apart["line"] and "two sources" not in apart["line"]
+
+
+# ---- round thirty: the Public Suffix List, and unknown said as unknown ---------------------
+
+def test_multi_tenant_suffixes_split_their_tenants_and_keep_one_tenants_hosts_together():
+    """minia2auk, round 30: `ltd.uk` is a public suffix, so `rpc.acme.ltd.uk` belongs to
+    `acme.ltd.uk`; last-two-labels merged every *.ltd.uk company, and got workers.dev wrong in
+    both directions at once."""
+    hint = reconcile.operator_hint
+    assert reconcile.operator_hint_basis("rpc.acme.ltd.uk")["hint"] == "acme.ltd.uk"
+    assert reconcile.operator_hint_basis("rpc.acme.ltd.uk")["suffix"] == "ltd.uk"
+    assert hint("a.workers.dev") != hint("b.workers.dev")
+    assert hint("x.vendor.workers.dev") == hint("y.vendor.workers.dev") == "vendor.workers.dev"
+    assert hint("one.github.io") != hint("two.github.io")
+    assert hint("node.example.com.au") == "example.com.au"
+
+
+def test_wildcard_and_exception_rules_follow_the_list():
+    # *.ck makes every second-level name under ck a suffix; !www.ck excepts www.ck.
+    assert reconcile.operator_hint_basis("rpc.shop.example.ck")["suffix"] == "example.ck"
+    assert reconcile.operator_hint("rpc.shop.example.ck") == "shop.example.ck"
+    assert reconcile.operator_hint_basis("api.www.ck")["suffix"] == "ck"
+    assert reconcile.operator_hint("api.www.ck") == "www.ck"
+
+
+def test_a_host_no_rule_covers_is_unknown_and_merges_with_nothing():
+    """A fallback that looks like a rule turns a known unknown into a confident merge key."""
+    basis = reconcile.operator_hint_basis("rpc.node.internal-cluster")
+    assert basis == {"hint": "rpc.node.internal-cluster", "host": "rpc.node.internal-cluster",
+                     "suffix": "", "rule": "unknown-suffix"}
+    assert reconcile.operator_hint("a.node.internal-cluster") != reconcile.operator_hint("b.node.internal-cluster")
+    assert reconcile.operator_hint_basis("workers.dev")["rule"] == "host is a public suffix"
+
+
+def test_without_the_list_every_name_is_unknown_not_guessed(monkeypatch, tmp_path):
+    monkeypatch.setattr(reconcile, "PUBLIC_SUFFIX_LIST", tmp_path / "absent.dat")
+    reconcile._public_suffixes.cache_clear()
+    try:
+        assert reconcile.operator_hint_basis("base.alchemy.com")["rule"] == "unknown-suffix"
+        assert reconcile.operator_hint("base.alchemy.com") != reconcile.operator_hint("eth.alchemy.com")
+    finally:
+        reconcile._public_suffixes.cache_clear()
+
+
+def test_the_shipped_list_is_the_public_suffix_list_with_a_version():
+    version, rules, wildcards, exceptions = reconcile._public_suffixes()
+    assert version and len(rules) > 5000
+    assert {"ltd.uk", "workers.dev", "github.io", "s3.amazonaws.com"} <= rules
+    assert "ck" in wildcards and "www.ck" in exceptions
+    head = reconcile.PUBLIC_SUFFIX_LIST.read_text(encoding="utf-8")[:400]
+    assert "Mozilla Public" in head, "the MPL notice travels with the list"

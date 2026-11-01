@@ -2,3 +2,7 @@ x402-reconcile
 Copyright (C) 2026 PARTH MAURIA SAXENA
 
 Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+scripts/public_suffix_list.dat is the Public Suffix List
+(https://publicsuffix.org/list/), distributed unmodified under the
+Mozilla Public License, Version 2.0 (https://mozilla.org/MPL/2.0/).
