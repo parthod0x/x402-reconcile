@@ -201,7 +201,15 @@ since a bad `safe` head is usually a property of the node software or its
 backend. So every named endpoint carries an `operator_hint` (its host's
 registrable domain), the witness says whether it shares the anchor's, and the
 line says so when it does. A hint, not a proof: one operator can own several
-domains, and one domain can front several operators. Re-reading the anchor from its own
+domains, and one domain can front several operators. The two directions are
+not equal: a shared hint is evidence of dependence, a different hint is only
+the absence of a warning - resold capacity, a CDN in front of one origin or a
+front end on a provider's gateway all give unrelated names to one backend - so
+nothing counts a mismatch as a second source. Each hint carries its basis
+(host, suffix assumed, rule), so a suffix the short list lacks shows on the
+row instead of silently splitting one operator. The hint is co-tenancy of a
+name, not a failure domain: an anycast name spans nodes that fail apart, and
+shared failure in time is what the run history records. Re-reading the anchor from its own
 endpoint was rejected: that is self-consistency, which a liar with a
 consistent local view passes, not corroboration. Attribution is
 asymmetric and the line does not resolve it: "X at b vs Y on a's chain"
@@ -657,17 +665,21 @@ def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, O
     or lagging inside its own safe head) are different facts about the peer,
     and the same name failing run after run is an operator signal.
 
-    Every endpoint named in the result carries its operator_hint (see
-    operator_hint): roles count endpoints, and two endpoints of one operator
-    are one source.
+    Every endpoint named in the result carries its operator_hint and the
+    hint's basis (see operator_hint_basis): roles count endpoints, and two
+    endpoints of one operator are one source. A shared hint marks dependence;
+    shares_operator_hint_with_anchor False is the absence of that warning,
+    never a second vote, and no verdict reads it.
 
     Returns {"contradictions": [{"height", "text", "sides": [{"hash", "at",
-    "operator_hints", "role"}, ...]}], "not_compared": [heights],
-    "not_compared_detail": [{"height", "endpoint", "outcome"}], "witness":
-    {"endpoint", "operator_hint", "shares_operator_hint_with_anchor",
-    "height", "how"} or None, "no_witness": [{"endpoint", "operator_hint",
+    "operator_hints", "operator_hint_bases", "role"}, ...]}], "not_compared":
+    [heights], "not_compared_detail": [{"height", "endpoint", "outcome"}],
+    "witness": {"endpoint", "operator_hint", "operator_hint_basis",
+    "shares_operator_hint_with_anchor", "height", "how"} or None,
+    "no_witness": [{"endpoint", "operator_hint", "operator_hint_basis",
     "safe", "outcome"}], "unwitnessed": reason or None, "anchor": {"height",
-    "at", "operator_hints"}}."""
+    "at", "operator_hints", "operator_hint_bases"}}; a basis is {"host",
+    "suffix", "rule"}, an *_bases map is keyed by the names in `at`."""
     claims = [c for c in claims if c[3]]
     result: Dict[str, Any] = {"contradictions": [], "not_compared": [], "not_compared_detail": [], "witness": None,
                               "no_witness": [], "unwitnessed": None, "anchor": None}
@@ -689,10 +701,11 @@ def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, O
     names = [c[0] for c in anchors]
     # With a tie the first claim is the anchor and the second its witness.
     anchor_at = names if len(anchors) == 1 else names[:1]
-    result["anchor"] = {"height": top, "at": anchor_at, "operator_hints": _operator_hints(anchor_at)}
+    result["anchor"] = {"height": top, "at": anchor_at, "operator_hints": _operator_hints(anchor_at),
+                        "operator_hint_bases": _operator_hint_bases(anchor_at)}
 
     def witness(name: str, how: str) -> Dict[str, Any]:
-        return {"endpoint": name, "operator_hint": operator_hint(name),
+        return {"endpoint": name, "operator_hint": operator_hint(name), "operator_hint_basis": _basis(name),
                 "shares_operator_hint_with_anchor": operator_hint(name) in result["anchor"]["operator_hints"],
                 "height": top, "how": how}
     if len(anchors) > 1:
@@ -704,7 +717,7 @@ def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, O
             theirs, outcome = _ask(header_fn, c[1], top)
             if not theirs:
                 result["no_witness"].append({"endpoint": c[0], "operator_hint": operator_hint(c[0]),
-                                             "safe": c[4], "outcome": outcome})
+                                             "operator_hint_basis": _basis(c[0]), "safe": c[4], "outcome": outcome})
                 continue
             if theirs != anchors[0][3]:
                 result["contradictions"].append({
@@ -745,12 +758,22 @@ def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, O
 
 
 def _side(block_hash: str, at: List[str], role: str) -> Dict[str, Any]:
-    return {"hash": block_hash, "at": at, "operator_hints": _operator_hints(at), "role": role}
+    return {"hash": block_hash, "at": at, "operator_hints": _operator_hints(at),
+            "operator_hint_bases": _operator_hint_bases(at), "role": role}
 
 
 def _operator_hints(names: List[str]) -> List[str]:
     """Distinct operator hints of `names`, in order: two names, one hint, one voice."""
     return list(dict.fromkeys(operator_hint(n) for n in names))
+
+
+def _basis(name: str) -> Dict[str, str]:
+    """The basis without the hint it produced, for a row that already carries the hint."""
+    return {k: v for k, v in operator_hint_basis(name).items() if k != "hint"}
+
+
+def _operator_hint_bases(names: List[str]) -> Dict[str, Dict[str, str]]:
+    return {n: _basis(n) for n in names}
 
 
 def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None, header_fn=None,
@@ -1139,19 +1162,40 @@ def operator_hint(endpoint: str) -> str:
     base-mainnet.g.alchemy.com and base.alchemy.com both give alchemy.com; an
     IP literal gives itself, a bare label (as in tests) itself. A hint, not a
     proof: one operator can own several domains, and one domain can front
-    several operators (a gateway reselling upstreams). It costs no call and
-    states only what the hostname already says, which a reader would
-    otherwise have to work out from prose.
+    several operators (a gateway reselling upstreams). A match is evidence of
+    dependence; a mismatch is not evidence of independence. It costs no call
+    and states only what the hostname already says, which a reader would
+    otherwise have to work out from prose. Resolving the name (to group by
+    address or network) was rejected: that turns a pure function of the
+    record into a live lookup whose answer changes minutes later.
+    """
+    return operator_hint_basis(endpoint)["hint"]
+
+
+def operator_hint_basis(endpoint: str) -> Dict[str, str]:
+    """The hint with what it was computed from: {"hint", "host", "suffix", "rule"}.
+
+    The suffix list is short, and it is applied to hostnames nobody here
+    chose, so a suffix it lacks splits or merges operators without any sign
+    in the record. Carrying the host, the suffix assumed and the rule used
+    makes such a miss readable on the row.
     """
     host = endpoint.rsplit("@", 1)[-1].lower()
     if host.startswith("["):
-        return host.split("]", 1)[0] + "]"
+        literal = host.split("]", 1)[0] + "]"
+        return {"hint": literal, "host": literal, "suffix": "", "rule": "ip literal"}
     host = host.split(":", 1)[0].rstrip(".")
     labels = host.split(".")
-    if len(labels) <= 2 or all(label.isdigit() for label in labels):
-        return host
-    keep = 3 if labels[-2] in _SHARED_SECOND_LEVEL and len(labels[-1]) == 2 else 2
-    return ".".join(labels[-keep:])
+    if all(label.isdigit() for label in labels) and len(labels) == 4:
+        return {"hint": host, "host": host, "suffix": "", "rule": "ip literal"}
+    if len(labels) == 1:
+        return {"hint": host, "host": host, "suffix": "", "rule": "single label"}
+    if len(labels) == 2:
+        return {"hint": host, "host": host, "suffix": labels[-1], "rule": "whole host"}
+    if labels[-2] in _SHARED_SECOND_LEVEL and len(labels[-1]) == 2:
+        return {"hint": ".".join(labels[-3:]), "host": host, "suffix": ".".join(labels[-2:]),
+                "rule": "shared second level"}
+    return {"hint": ".".join(labels[-2:]), "host": host, "suffix": labels[-1], "rule": "last two labels"}
 
 
 def _strictly_increasing(logs: List[Dict[str, Any]], where: str) -> None:

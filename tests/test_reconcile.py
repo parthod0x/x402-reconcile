@@ -1539,6 +1539,7 @@ def test_a_leading_primary_is_asked_for_the_peers_finalized_blocks():
     assert out["smell"] is False and "drift, not a clamp" in out["line"]
     assert "its top block (53317988 at primary) witnessed by publicnode" in out["line"], out["line"]
     assert out["witness"] == {"endpoint": "publicnode", "operator_hint": "publicnode",
+                              "operator_hint_basis": {"host": "publicnode", "suffix": "", "rule": "single label"},
                               "shares_operator_hint_with_anchor": False, "height": 53317988,
                               "how": "reports the block below its safe head 53318372"}
     assert sorted(calls) == [("https://primary", 53316253), ("https://primary", 53317802),
@@ -1698,9 +1699,12 @@ def test_an_eligible_peer_that_errors_is_named_apart_from_one_with_no_block():
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), header_fn=header,
                                         sleep=lambda s: None, primary_url="https://a")
     assert out["witness"] is None
+    single = lambda name: {"host": name, "suffix": "", "rule": "single label"}
     assert out["no_witness"] == [
-        {"endpoint": "broken", "operator_hint": "broken", "safe": 1570, "outcome": "error (RpcError)"},
-        {"endpoint": "pruned", "operator_hint": "pruned", "safe": 1560, "outcome": "no block"}], out["no_witness"]
+        {"endpoint": "broken", "operator_hint": "broken", "operator_hint_basis": single("broken"),
+         "safe": 1570, "outcome": "error (RpcError)"},
+        {"endpoint": "pruned", "operator_hint": "pruned", "operator_hint_basis": single("pruned"),
+         "safe": 1560, "outcome": "no block"}], out["no_witness"]
     assert "(broken at safe 1570: error (RpcError); pruned at safe 1560: no block)" in out["line"], out["line"]
     assert "upstream gone" not in out["line"] and "https://" not in out["line"], \
         "only the error's class is kept: a message can carry an endpoint URL with a key in it"
@@ -1764,3 +1768,49 @@ def test_every_side_and_every_silent_peer_carries_its_operator_hints():
                                         header_fn=lambda url, height: None, sleep=lambda s: None, primary_url="https://a")
     assert [w["operator_hint"] for w in out["no_witness"]] == ["llamarpc.com", "llamarpc.com"], \
         "two silent endpoints, one operator: the record shows it"
+
+
+# ---- round twenty-nine: the basis rides with the hint; a mismatch is not a vote ---------------
+
+def test_every_hint_carries_its_basis_so_a_missing_suffix_shows_on_the_row():
+    """minia2auk, round 29: the short suffix list is applied to hostnames nobody here chose,
+    and a suffix it lacks splits or merges operators silently. With the basis on the row, the
+    miss is readable: here `ltd.uk` is not in the list, so two unrelated companies under it
+    share the hint `ltd.uk` - and the row says the rule was `last two labels`, suffix `uk`."""
+    basis = reconcile.operator_hint_basis
+    assert basis("base-mainnet.g.alchemy.com") == {"hint": "alchemy.com", "host": "base-mainnet.g.alchemy.com",
+                                                   "suffix": "com", "rule": "last two labels"}
+    assert basis("rpc.example.co.uk")["rule"] == "shared second level"
+    assert basis("rpc.example.co.uk")["suffix"] == "co.uk"
+    missed = basis("rpc.acme.ltd.uk")
+    assert missed["hint"] == "ltd.uk" and missed["suffix"] == "uk" and missed["rule"] == "last two labels"
+    assert basis("203.0.113.7:8545")["rule"] == basis("[2001:db8::1]")["rule"] == "ip literal"
+
+    real = {1000: "0xa10", 1005: "0xa15"}
+    fit = {"finalized_height": 1005, "finalized_hash": "0xa15", "host": "a.drpc.org"}
+    peers = {"https://b.drpc.org": (1005, "0xa15"), "https://c.blast.io": (1000, "0xbad")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
+                                        header_fn=_finalized_chain(real), sleep=lambda s: None)
+    assert out["witness"]["operator_hint_basis"] == {"host": "b.drpc.org", "suffix": "org", "rule": "last two labels"}
+    sides = out["contradictions"][0]["sides"]
+    assert sides[0]["operator_hint_bases"] == {"c.blast.io": {"host": "c.blast.io", "suffix": "io",
+                                                              "rule": "last two labels"}}
+
+
+def test_a_different_hint_is_the_absence_of_a_warning_not_a_second_source():
+    """A shared hint is evidence of dependence; a different one is not evidence of
+    independence. So the verdict and the line are the same whether or not the witness's hint
+    differs from the anchor's, except for the warning when it does not."""
+    real = {1000: "0xa10", 1005: "0xa15"}
+
+    def run(anchor_host, witness_host):
+        fit = {"finalized_height": 1000, "finalized_hash": "0xa10", "host": "primary.example.net"}
+        peers = {"https://%s" % anchor_host: (1005, "0xa15"), "https://%s" % witness_host: (1000, "0xa10")}
+        return reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
+                                             header_fn=_finalized_chain(real), sleep=lambda s: None,
+                                             primary_url="https://primary.example.net")
+    shared, apart = run("base.alchemy.com", "eth.alchemy.com"), run("base.alchemy.com", "base.llamarpc.com")
+    assert shared["smell"] == apart["smell"] is False
+    assert "possibly one source" in shared["line"]
+    assert "possibly one source" not in apart["line"]
+    assert "independent" not in apart["line"] and "two sources" not in apart["line"]
