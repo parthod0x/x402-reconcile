@@ -195,7 +195,13 @@ every height-bearing line, in the result (`witness`) and in the history
 record, and so is every eligible endpoint that gave no block (`no_witness`,
 with its safe head and whether it errored or answered without one), and each contradiction names the role of each side (anchor,
 witness, finalized claim, anchor witnessed or unwitnessed), so a later
-audit can tell one unverified source from two independent ones. Re-reading the anchor from its own
+audit can tell one unverified source from two independent ones. Roles count
+endpoints, not operators: two endpoints behind one provider are one voice,
+since a bad `safe` head is usually a property of the node software or its
+backend. So every named endpoint carries an `operator_hint` (its host's
+registrable domain), the witness says whether it shares the anchor's, and the
+line says so when it does. A hint, not a proof: one operator can own several
+domains, and one domain can front several operators. Re-reading the anchor from its own
 endpoint was rejected: that is self-consistency, which a liar with a
 consistent local view passes, not corroboration. Attribution is
 asymmetric and the line does not resolve it: "X at b vs Y on a's chain"
@@ -651,11 +657,17 @@ def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, O
     or lagging inside its own safe head) are different facts about the peer,
     and the same name failing run after run is an operator signal.
 
+    Every endpoint named in the result carries its operator_hint (see
+    operator_hint): roles count endpoints, and two endpoints of one operator
+    are one source.
+
     Returns {"contradictions": [{"height", "text", "sides": [{"hash", "at",
-    "role"}, ...]}], "not_compared": [heights], "not_compared_detail":
-    [{"height", "endpoint", "outcome"}], "witness": {"endpoint", "height",
-    "how"} or None, "no_witness": [{"endpoint", "safe", "outcome"}],
-    "unwitnessed": reason or None, "anchor": {"height", "at"}}."""
+    "operator_hints", "role"}, ...]}], "not_compared": [heights],
+    "not_compared_detail": [{"height", "endpoint", "outcome"}], "witness":
+    {"endpoint", "operator_hint", "shares_operator_hint_with_anchor",
+    "height", "how"} or None, "no_witness": [{"endpoint", "operator_hint",
+    "safe", "outcome"}], "unwitnessed": reason or None, "anchor": {"height",
+    "at", "operator_hints"}}."""
     claims = [c for c in claims if c[3]]
     result: Dict[str, Any] = {"contradictions": [], "not_compared": [], "not_compared_detail": [], "witness": None,
                               "no_witness": [], "unwitnessed": None, "anchor": None}
@@ -668,33 +680,39 @@ def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, O
                 result["contradictions"].append({
                     "height": n, "text": "height %d: %s finalized at %s vs %s finalized at %s" % (
                         n, group[0][3][:12], group[0][0], c[3][:12], c[0]),
-                    "sides": [{"hash": group[0][3], "at": [group[0][0]], "role": "finalized claim"},
-                              {"hash": c[3], "at": [c[0]], "role": "finalized claim"}]})
+                    "sides": [_side(group[0][3], [group[0][0]], "finalized claim"),
+                              _side(c[3], [c[0]], "finalized claim")]})
     if result["contradictions"] or not by_height:
         return result
     top = max(by_height)
     anchors = by_height[top]
     names = [c[0] for c in anchors]
     # With a tie the first claim is the anchor and the second its witness.
-    result["anchor"] = {"height": top, "at": names if len(anchors) == 1 else names[:1]}
+    anchor_at = names if len(anchors) == 1 else names[:1]
+    result["anchor"] = {"height": top, "at": anchor_at, "operator_hints": _operator_hints(anchor_at)}
+
+    def witness(name: str, how: str) -> Dict[str, Any]:
+        return {"endpoint": name, "operator_hint": operator_hint(name),
+                "shares_operator_hint_with_anchor": operator_hint(name) in result["anchor"]["operator_hints"],
+                "height": top, "how": how}
     if len(anchors) > 1:
-        result["witness"] = {"endpoint": anchors[1][0], "height": top, "how": "finalized the same block"}
+        result["witness"] = witness(anchors[1][0], "finalized the same block")
     else:
         eligible = sorted((c for c in claims if c[2] != top and c[1] and c[4] is not None and c[4] >= top),
                           key=lambda c: -c[4])
         for c in eligible:
             theirs, outcome = _ask(header_fn, c[1], top)
             if not theirs:
-                result["no_witness"].append({"endpoint": c[0], "safe": c[4], "outcome": outcome})
+                result["no_witness"].append({"endpoint": c[0], "operator_hint": operator_hint(c[0]),
+                                             "safe": c[4], "outcome": outcome})
                 continue
             if theirs != anchors[0][3]:
                 result["contradictions"].append({
                     "height": top, "text": "height %d: %s finalized at %s (anchor) vs %s at %s (witness, safe %d)" % (
                         top, anchors[0][3][:12], ", ".join(names), theirs[:12], c[0], c[4]),
-                    "sides": [{"hash": anchors[0][3], "at": names, "role": "anchor"},
-                              {"hash": theirs, "at": [c[0]], "role": "witness"}]})
+                    "sides": [_side(anchors[0][3], names, "anchor"), _side(theirs, [c[0]], "witness")]})
                 return result
-            result["witness"] = {"endpoint": c[0], "height": top, "how": "reports the block below its safe head %d" % c[4]}
+            result["witness"] = witness(c[0], "reports the block below its safe head %d" % c[4])
             break
         else:
             result["unwitnessed"] = ("no other endpoint's safe head had reached %d" % top if not eligible else
@@ -722,9 +740,17 @@ def _finalized_contradictions(claims: List[Tuple[str, Optional[str], int, str, O
             result["contradictions"].append({
                 "height": n, "text": "height %d: %s finalized at %s vs %s on %s's chain (%s)" % (
                     n, by_height[n][0][3][:12], ", ".join(at), theirs[:12], asker[0], vouched),
-                "sides": [{"hash": by_height[n][0][3], "at": at, "role": "finalized claim"},
-                          {"hash": theirs, "at": [asker[0]], "role": vouched}]})
+                "sides": [_side(by_height[n][0][3], at, "finalized claim"), _side(theirs, [asker[0]], vouched)]})
     return result
+
+
+def _side(block_hash: str, at: List[str], role: str) -> Dict[str, Any]:
+    return {"hash": block_hash, "at": at, "operator_hints": _operator_hints(at), "role": role}
+
+
+def _operator_hints(names: List[str]) -> List[str]:
+    """Distinct operator hints of `names`, in order: two names, one hint, one voice."""
+    return list(dict.fromkeys(operator_hint(n) for n in names))
 
 
 def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None, header_fn=None,
@@ -802,8 +828,11 @@ def endpoint_crosscheck(fit: Dict[str, Any], peers: List[str], finality_fn=None,
              "no finalized hashes contradict; not compared at height(s) %s" % ", ".join(map(str, unasked)))
     if hashes["anchor"]:
         anchor = "%d at %s" % (hashes["anchor"]["height"], ", ".join(hashes["anchor"]["at"]))
-        chain += (", its top block (%s) witnessed by %s" % (anchor, hashes["witness"]["endpoint"]) if hashes["witness"]
-                  else "; the top claim (%s) has no second witness: %s, so the chain it anchors is unconfirmed"
+        shared = (" (same operator hint as the anchor, %s: possibly one source, not two)"
+                  % hashes["witness"]["operator_hint"] if hashes["witness"]
+                  and hashes["witness"]["shares_operator_hint_with_anchor"] else "")
+        chain += (", its top block (%s) witnessed by %s%s" % (anchor, hashes["witness"]["endpoint"], shared)
+                  if hashes["witness"] else "; the top claim (%s) has no second witness: %s, so the chain it anchors is unconfirmed"
                   % (anchor, hashes["unwitnessed"]))
     undetermined = ("cross-check: undetermined - finalized claims contradict (%s): one chain cannot finalize two "
                     "blocks at one height, and every verdict here ranks heights on that assumption, so none is "
@@ -1096,6 +1125,33 @@ def _tiled_blocks(url: str, address: str, topics: list, from_block: int, to_bloc
 def _host(url: str) -> str:
     from urllib.parse import urlparse
     return urlparse(url).netloc or url
+
+
+# Second-level labels under which a registrable name takes three labels
+# (example.co.uk, example.com.au). A short list, not the Public Suffix List:
+# the hint groups endpoints for a reader, it does not establish identity.
+_SHARED_SECOND_LEVEL = {"ac", "co", "com", "edu", "gov", "ne", "net", "or", "org"}
+
+
+def operator_hint(endpoint: str) -> str:
+    """Which endpoints are probably one operator: the host's registrable domain.
+
+    base-mainnet.g.alchemy.com and base.alchemy.com both give alchemy.com; an
+    IP literal gives itself, a bare label (as in tests) itself. A hint, not a
+    proof: one operator can own several domains, and one domain can front
+    several operators (a gateway reselling upstreams). It costs no call and
+    states only what the hostname already says, which a reader would
+    otherwise have to work out from prose.
+    """
+    host = endpoint.rsplit("@", 1)[-1].lower()
+    if host.startswith("["):
+        return host.split("]", 1)[0] + "]"
+    host = host.split(":", 1)[0].rstrip(".")
+    labels = host.split(".")
+    if len(labels) <= 2 or all(label.isdigit() for label in labels):
+        return host
+    keep = 3 if labels[-2] in _SHARED_SECOND_LEVEL and len(labels[-1]) == 2 else 2
+    return ".".join(labels[-keep:])
 
 
 def _strictly_increasing(logs: List[Dict[str, Any]], where: str) -> None:

@@ -1538,7 +1538,8 @@ def test_a_leading_primary_is_asked_for_the_peers_finalized_blocks():
                                         sleep=lambda s: None, primary_url="https://primary")
     assert out["smell"] is False and "drift, not a clamp" in out["line"]
     assert "its top block (53317988 at primary) witnessed by publicnode" in out["line"], out["line"]
-    assert out["witness"] == {"endpoint": "publicnode", "height": 53317988,
+    assert out["witness"] == {"endpoint": "publicnode", "operator_hint": "publicnode",
+                              "shares_operator_hint_with_anchor": False, "height": 53317988,
                               "how": "reports the block below its safe head 53318372"}
     assert sorted(calls) == [("https://primary", 53316253), ("https://primary", 53317802),
                              ("https://publicnode", 53317988)], "one witness call, then one call per lower height"
@@ -1697,8 +1698,9 @@ def test_an_eligible_peer_that_errors_is_named_apart_from_one_with_no_block():
     out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620), header_fn=header,
                                         sleep=lambda s: None, primary_url="https://a")
     assert out["witness"] is None
-    assert out["no_witness"] == [{"endpoint": "broken", "safe": 1570, "outcome": "error (RpcError)"},
-                                 {"endpoint": "pruned", "safe": 1560, "outcome": "no block"}], out["no_witness"]
+    assert out["no_witness"] == [
+        {"endpoint": "broken", "operator_hint": "broken", "safe": 1570, "outcome": "error (RpcError)"},
+        {"endpoint": "pruned", "operator_hint": "pruned", "safe": 1560, "outcome": "no block"}], out["no_witness"]
     assert "(broken at safe 1570: error (RpcError); pruned at safe 1560: no block)" in out["line"], out["line"]
     assert "upstream gone" not in out["line"] and "https://" not in out["line"], \
         "only the error's class is kept: a message can carry an endpoint URL with a key in it"
@@ -1712,3 +1714,53 @@ def test_the_default_reader_raises_on_an_rpc_failure_instead_of_reading_it_as_no
         reconcile._header_at("https://peer", 1005)
     monkeypatch.setattr(reconcile, "_rpc", lambda url, method, params: None)
     assert reconcile._header_at("https://peer", 1005) is None
+
+
+# ---- round twenty-eight: roles count endpoints; an operator hint groups them ----------------
+
+def test_the_operator_hint_is_the_registrable_domain_and_says_no_more():
+    """minia2auk, round 28: two endpoints behind one provider are one voice. The hostname is
+    already in hand, and a domain suffix is a cheaper grouping key than an identity claim."""
+    hint = reconcile.operator_hint
+    assert hint("base-mainnet.g.alchemy.com") == hint("base.alchemy.com") == "alchemy.com"
+    assert hint("base-rpc.publicnode.com:443") == "publicnode.com"
+    assert hint("rpc.example.co.uk") == "example.co.uk" and hint("node.example.com.au") == "example.com.au"
+    assert hint("mainnet.base.org") == "base.org" and hint("1rpc.io") == "1rpc.io"
+    assert hint("user:secret@rpc.example.com") == "example.com"
+    assert hint("203.0.113.7:8545") == "203.0.113.7" and hint("[2001:db8::1]:8545") == "[2001:db8::1]"
+    assert hint("primary") == "primary"
+    assert "not a proof" in " ".join(reconcile.operator_hint.__doc__.split())
+
+
+def test_a_witness_of_the_anchors_own_operator_is_flagged_as_possibly_one_source():
+    """An anchor and a witness on one provider read as two independent voices while being one,
+    so the witness says it shares the anchor's hint and the line says so."""
+    real = {1000: "0xa10", 1005: "0xa15"}
+    fit = {"finalized_height": 1000, "finalized_hash": "0xa10", "host": "primary.example.net"}
+    peers = {"https://base.alchemy.com": (1005, "0xa15"), "https://base-mainnet.g.alchemy.com": (1000, "0xa10")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
+                                        header_fn=_finalized_chain(real), sleep=lambda s: None,
+                                        primary_url="https://primary.example.net")
+    assert out["witness"]["operator_hint"] == "alchemy.com"
+    assert out["witness"]["shares_operator_hint_with_anchor"] is True
+    assert ("witnessed by base-mainnet.g.alchemy.com (same operator hint as the anchor, alchemy.com: "
+            "possibly one source, not two)") in out["line"], out["line"]
+
+
+def test_every_side_and_every_silent_peer_carries_its_operator_hints():
+    real = {1000: "0xa10", 1005: "0xa15"}
+    fit = {"finalized_height": 1005, "finalized_hash": "0xa15", "host": "a.drpc.org"}
+    peers = {"https://b.drpc.org": (1005, "0xa15"), "https://c.blast.io": (1000, "0xbad")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
+                                        header_fn=_finalized_chain(real), sleep=lambda s: None)
+    sides = out["contradictions"][0]["sides"]
+    assert [s["operator_hints"] for s in sides] == [["blast.io"], ["drpc.org"]]
+    assert out["witness"]["shares_operator_hint_with_anchor"] is True
+
+    fit = {"finalized_height": 1000, "finalized_hash": "0xa10", "host": "a"}
+    peers = {"https://x.llamarpc.com": (1000, "0xa10"), "https://y.llamarpc.com": (990, "0x990"),
+             "https://d.example.org": (1005, "0xa15")}
+    out = reconcile.endpoint_crosscheck(fit, list(peers), finality_fn=_peers(peers, 570, 620),
+                                        header_fn=lambda url, height: None, sleep=lambda s: None, primary_url="https://a")
+    assert [w["operator_hint"] for w in out["no_witness"]] == ["llamarpc.com", "llamarpc.com"], \
+        "two silent endpoints, one operator: the record shows it"
