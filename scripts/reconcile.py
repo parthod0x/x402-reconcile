@@ -294,7 +294,9 @@ returns them), and counted: the read's metadata names each page that
 dropped any (`outside_range_dropped`), because answering wider than asked is
 a property of the provider, and the drop is the only place it shows. Every
 remaining dedupe is on (blockHash, logIndex), never on blockNumber, which
-would merge two branches.
+would merge two branches, and is counted too: a receipt that repeats a log is
+a malformed answer, and its metadata says how many it repeated
+(`receipt_duplicates_dropped`).
 
 Every range asked for is at most PAGE_BLOCKS blocks, and the last one ends
 exactly at the window's end, so an empty answer means "these blocks were
@@ -1040,7 +1042,8 @@ def _pad(address: str) -> str:
     return "0x" + address[2:].lower().rjust(64, "0")
 
 
-def transfers_in_logs(logs: List[Dict[str, Any]], asset: str, payer: str) -> List[Dict[str, Any]]:
+def transfers_in_logs(logs: List[Dict[str, Any]], asset: str, payer: str,
+                      duplicates: Optional[List[Tuple[str, str]]] = None) -> List[Dict[str, Any]]:
     """The asset's Transfer events whose `from` is the payer - never the first.
 
     Deduplicated on (blockHash, logIndex): providers return logs
@@ -1048,6 +1051,8 @@ def transfers_in_logs(logs: List[Dict[str, Any]], asset: str, payer: str) -> Lis
     a cache hit - so the same log can arrive in two pages, and counted twice
     it would push a split payment's sum past the amount and fabricate a
     confirmed. The identity survives a provider that ignores the range.
+    Each identity dropped as a repeat is appended to `duplicates`, so the
+    caller can say how many there were instead of dropping them silently.
     """
     out, seen = [], set()
     for log in logs or []:
@@ -1058,6 +1063,8 @@ def transfers_in_logs(logs: List[Dict[str, Any]], asset: str, payer: str) -> Lis
             continue
         ident = ((log.get("blockHash") or log.get("transactionHash") or "").lower(), str(log.get("logIndex")))
         if ident in seen:
+            if duplicates is not None:
+                duplicates.append(ident)
             continue
         seen.add(ident)
         out.append({
@@ -1589,14 +1596,15 @@ def transfers_in_tx(network: str, asset: str, payer: str, tx: str,
     logs = receipt.get("logs") or []
     nonce_in_tx = True
     later: List[Dict[str, Any]] = []
+    duplicates: List[Tuple[str, str]] = []
     if nonce:
         bound = logs_bound_to(logs, asset, payer, nonce)
         if bound is None:
             nonce_in_tx = False
         else:
             logs, later_logs = bound
-            later = transfers_in_logs(later_logs, asset, payer)
-    found = transfers_in_logs(logs, asset, payer)
+            later = transfers_in_logs(later_logs, asset, payer, duplicates)
+    found = transfers_in_logs(logs, asset, payer, duplicates)
     assert_canonical(url, found + later)
     head = int(_rpc(url, "eth_blockNumber", []), 16)
     # The receipt's own block, not its transfers': a tx that moved nothing
@@ -1621,7 +1629,8 @@ def transfers_in_tx(network: str, asset: str, payer: str, tx: str,
     meta = {"head": head, "block": number, "block_hash": block_hash,
             "confirmed_depth": number is not None and number <= head - CONFIRMATIONS,
             "finalized": final,
-            "finalized_height": finality(url)[0], "finalized_hash": finality(url)[1]}
+            "finalized_height": finality(url)[0], "finalized_hash": finality(url)[1],
+            "receipt_duplicates_dropped": len(duplicates)}
     return found, nonce_in_tx, later, meta
 
 

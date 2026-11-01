@@ -730,7 +730,8 @@ def test_a_receipt_reports_its_own_depth(monkeypatch):
     monkeypatch.setattr(reconcile, "_rpc", rpc)
     found, in_tx, later, meta = reconcile.transfers_in_tx(NET, ASSET, PAYER, "0xbatch", nonce)
     assert len(found) == 1 and meta == {"head": 1000, "block": 990, "block_hash": "0xcanon3de", "confirmed_depth": False,
-                                        "finalized": True, "finalized_height": 995, "finalized_hash": "0xfin"}, meta
+                                        "finalized": True, "finalized_height": 995, "finalized_hash": "0xfin",
+                                        "receipt_duplicates_dropped": 0}, meta
     line = _line("settled", nonce, "2026-10-21T10:00:00+00:00", tx="0xbatch")
     row = _by_nonce([line], pay_to=PAY_TO, consumed_fn=lambda *a: True, event_fn=lambda *a: ("used", "0xbatch", dict(DEEP)),
                     tx_fn=reconcile.transfers_in_tx)[nonce]
@@ -1867,3 +1868,28 @@ def test_the_shipped_list_is_the_public_suffix_list_with_a_version():
     assert "ck" in wildcards and "www.ck" in exceptions
     head = reconcile.PUBLIC_SUFFIX_LIST.read_text(encoding="utf-8")[:400]
     assert "Mozilla Public" in head, "the MPL notice travels with the list"
+
+
+
+def test_a_receipt_that_repeats_a_log_is_counted_not_silently_deduplicated(monkeypatch):
+    """minia2auk, round 30: every dedupe should leave a count. A receipt repeating a log is a
+    malformed answer; summed twice it would invent a surplus, dropped silently it hides the fault."""
+    nonce = "0x" + "f9" * 32
+    pad = reconcile._pad
+    transfer = _receipt_log(reconcile.TRANSFER_TOPIC, [pad(PAYER), pad(PAY_TO)], hex(500000), 11, block=990)
+    logs = [_receipt_log(reconcile.AUTH_USED_TOPIC, [pad(PAYER), nonce], "0x", 10, block=990), transfer, dict(transfer)]
+
+    def rpc(url, method, params):
+        if method == "eth_getTransactionReceipt":
+            return {"logs": logs}
+        if method == "eth_getBlockByNumber":
+            if params[0] == "finalized":
+                return {"number": hex(995), "hash": "0xfin"}
+            return {"hash": "0xcanon%x" % int(params[0], 16)}
+        if method == "eth_blockNumber":
+            return hex(1000)
+        raise AssertionError(method)
+    monkeypatch.setattr(reconcile, "_rpc", rpc)
+    found, _, _, meta = reconcile.transfers_in_tx(NET, ASSET, PAYER, "0xbatch", nonce)
+    assert len(found) == 1, "the repeat is not summed"
+    assert meta["receipt_duplicates_dropped"] == 1, "and it is not hidden either"
