@@ -213,12 +213,16 @@ covers is `unknown-suffix` and keeps its whole name, never a guessed merge
 key. Each hint carries its basis (host, suffix, rule, list version) on the
 row. The hint is co-tenancy of a name, not a failure domain: an anycast name
 spans nodes that fail apart. No shared-failure grouping is computed. One that
-is must count per pair the reads where both were eligible and one was asked,
-the reads where both failed, and the reads where one did - (eligible_n,
-failed_together_n, one_failed_n) - and leave a pair it cannot separate
-`unknown`, never `independent`: two peers each asked twice look perfectly
-correlated, and absence of correlation, like a different hint, is not
-evidence of separation. Re-reading the anchor from its own
+is must count per pair and per window the reads where both were eligible and
+one was asked, the reads where both failed, and the reads where one did -
+(eligible_n, failed_together_n, one_failed_n) - with the window stored on the
+row, as a read stores its from_block, to_block and head, so two consumers
+regrouping the same rows reach the same verdict. It leaves a pair it cannot
+separate `unknown`, never `independent`: two peers each asked twice look
+perfectly correlated, and absence of correlation, like a different hint, is
+not evidence of separation. A pair with eligible_n 0 is `unmeasured`, and a
+pair with no row is not a pair with zeros: a consumer that reads the absence
+as a count gets a cleaner story than the data holds. Re-reading the anchor from its own
 endpoint was rejected: that is self-consistency, which a liar with a
 consistent local view passes, not corroboration. Attribution is
 asymmetric and the line does not resolve it: "X at b vs Y on a's chain"
