@@ -222,7 +222,14 @@ separate `unknown`, never `independent`: two peers each asked twice look
 perfectly correlated, and absence of correlation, like a different hint, is
 not evidence of separation. A pair with eligible_n 0 is `unmeasured`, and a
 pair with no row is not a pair with zeros: a consumer that reads the absence
-as a count gets a cleaner story than the data holds. Re-reading the anchor from its own
+as a count gets a cleaner story than the data holds. So the output carries,
+per pair and window: the three counts and the window's bounds, never only a
+derived ratio, which a consumer cannot split differently; the window the read
+declared when it was issued, not when its answer arrived or its row was
+written, which a late re-read would move; endpoints as the pair's identity,
+not their operator hint, so a peer replaced mid-window is a second pair, not
+a silent merge of two populations under one key; and every `unmeasured` pair
+as a row of its own, or the state exists in this text and in no output. Re-reading the anchor from its own
 endpoint was rejected: that is self-consistency, which a liar with a
 consistent local view passes, not corroboration. Attribution is
 asymmetric and the line does not resolve it: "X at b vs Y on a's chain"
