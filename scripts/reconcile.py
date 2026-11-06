@@ -229,7 +229,11 @@ declared when it was issued, not when its answer arrived or its row was
 written, which a late re-read would move; endpoints as the pair's identity,
 not their operator hint, so a peer replaced mid-window is a second pair, not
 a silent merge of two populations under one key; and every `unmeasured` pair
-as a row of its own, or the state exists in this text and in no output. Re-reading the anchor from its own
+as a row of its own, or the state exists in this text and in no output. Its
+first test splits one stored set of rows twice, by the window each read
+declared and deliberately by arrival time, and requires the counts to
+differ: a fixture that gives the same numbers both ways cannot tell the rule
+from its absence, and passes whether or not the window is read. Re-reading the anchor from its own
 endpoint was rejected: that is self-consistency, which a liar with a
 consistent local view passes, not corroboration. Attribution is
 asymmetric and the line does not resolve it: "X at b vs Y on a's chain"
