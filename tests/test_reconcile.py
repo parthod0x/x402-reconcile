@@ -1893,3 +1893,165 @@ def test_a_receipt_that_repeats_a_log_is_counted_not_silently_deduplicated(monke
     found, _, _, meta = reconcile.transfers_in_tx(NET, ASSET, PAYER, "0xbatch", nonce)
     assert len(found) == 1, "the repeat is not summed"
     assert meta["receipt_duplicates_dropped"] == 1, "and it is not hidden either"
+
+
+# ---- shared-failure grouping (satroot#2): counts per pair and declared window -------------
+
+A, B, C = "a.example#aaaaaaaaaaaa", "b.example#bbbbbbbbbbbb", "c.example#cccccccccccc"
+
+
+def _read(endpoint, number, asked, answered, ok, network=NET):
+    return {"network": network, "endpoint": endpoint, "pass": number, "asked_at": asked, "answered_at": answered,
+            "window": reconcile.declared_window(datetime.fromisoformat(asked)), "ok": ok}
+
+
+def _run(at, reads, configured):
+    return {"at": at, "finality_reads": {"window": reconcile.declared_window(datetime.fromisoformat(at)),
+                                         "configured": {NET: configured}, "reads": reads}}
+
+
+def _by_pair(rows):
+    return {tuple(r["pair"]): r for r in rows}
+
+
+def test_the_declared_window_is_the_utc_day_the_read_was_asked_in():
+    late = datetime(2026, 10, 21, 23, 59, 59, tzinfo=timezone.utc)
+    assert reconcile.declared_window(late) == {"start": "2026-10-21T00:00:00+00:00",
+                                               "end": "2026-10-22T00:00:00+00:00"}
+
+
+def test_every_finality_read_is_recorded_with_its_pass_window_and_outcome_and_no_url():
+    ticks = iter(datetime(2026, 10, 21, 12, 0, s, tzinfo=timezone.utc) for s in range(10))
+    probe = reconcile.FinalityReads(clock=lambda: next(ticks))
+    answers = {"https://rpc.example/KEYSECRET": {"finalized": (1000, "0xa")}, "https://rpc.example/other": {}}
+    read = probe.wrap(NET, lambda url: answers[url])
+    read("https://rpc.example/KEYSECRET")
+    read("https://rpc.example/other")
+    read("https://rpc.example/KEYSECRET")
+
+    def broken(url):
+        raise reconcile.RpcError(url, -32000, "upstream gone", 502)
+    with pytest.raises(reconcile.RpcError):
+        probe.wrap(NET, broken)("https://rpc.example/other")
+    reads = probe.record(NOW)["reads"]
+    assert [(r["pass"], r["ok"]) for r in reads] == [(1, True), (1, False), (2, True), (2, False)], \
+        "the n-th ask of an endpoint is its pass n; an error is a failed read, recorded before it propagates"
+    assert reads[0]["endpoint"] != reads[1]["endpoint"], "two paths on one host are two endpoints"
+    assert reads[0]["endpoint"].startswith("rpc.example#")
+    assert reads[0]["asked_at"] == "2026-10-21T12:00:00+00:00" and reads[0]["answered_at"] == "2026-10-21T12:00:01+00:00"
+    assert reads[0]["window"] == {"start": "2026-10-21T00:00:00+00:00", "end": "2026-10-22T00:00:00+00:00"}
+    assert "KEYSECRET" not in json.dumps(probe.record(NOW)), "a key in the URL is never written down"
+
+
+def test_counts_are_per_pair_over_passes_where_both_were_asked():
+    runs = [
+        _run("2026-10-21T10:00:00+00:00", [
+            _read(A, 1, "2026-10-21T10:00:01+00:00", "2026-10-21T10:00:01+00:00", True),
+            _read(B, 1, "2026-10-21T10:00:02+00:00", "2026-10-21T10:00:02+00:00", False),
+            _read(C, 1, "2026-10-21T10:00:03+00:00", "2026-10-21T10:00:03+00:00", False)], [A, B, C]),
+        _run("2026-10-21T10:15:00+00:00", [
+            _read(A, 1, "2026-10-21T10:15:01+00:00", "2026-10-21T10:15:01+00:00", True),
+            _read(B, 1, "2026-10-21T10:15:02+00:00", "2026-10-21T10:15:02+00:00", True),
+            _read(C, 1, "2026-10-21T10:15:03+00:00", "2026-10-21T10:15:03+00:00", False),
+            # the re-read asks the peers only: A was not asked in pass 2
+            _read(B, 2, "2026-10-21T10:15:13+00:00", "2026-10-21T10:15:13+00:00", False),
+            _read(C, 2, "2026-10-21T10:15:14+00:00", "2026-10-21T10:15:14+00:00", False)], [A, B, C]),
+    ]
+    rows = _by_pair(reconcile.shared_failures(runs))
+    counts = {pair: (r["eligible_n"], r["failed_together_n"], r["one_failed_n"]) for pair, r in rows.items()}
+    assert counts == {(A, B): (2, 0, 1), (A, C): (2, 0, 2), (B, C): (3, 2, 1)}, counts
+    assert all(r["window"] == {"start": "2026-10-21T00:00:00+00:00", "end": "2026-10-22T00:00:00+00:00"}
+               for r in rows.values()), "the window's bounds travel on every row"
+    assert {r["verdict"] for r in rows.values()} == {"unknown"}, "a pair it cannot separate is never independent"
+
+
+def test_a_configured_pair_never_asked_together_is_an_unmeasured_row_not_a_missing_one():
+    """The primary smelled, so no peer was asked: every pair is a row with zeros, marked unmeasured."""
+    runs = [_run("2026-10-21T10:00:00+00:00",
+                 [_read(A, 1, "2026-10-21T10:00:01+00:00", "2026-10-21T10:00:01+00:00", True)], [A, B, C])]
+    rows = _by_pair(reconcile.shared_failures(runs))
+    assert set(rows) == {(A, B), (A, C), (B, C)}
+    assert all(r["verdict"] == "unmeasured" and r["eligible_n"] == 0 for r in rows.values())
+
+
+def test_a_peer_replaced_mid_window_is_a_second_pair_not_a_merge():
+    b2 = "b.example#222222222222"     # same host, new URL
+    runs = [
+        _run("2026-10-21T10:00:00+00:00", [
+            _read(A, 1, "2026-10-21T10:00:01+00:00", "2026-10-21T10:00:01+00:00", False),
+            _read(B, 1, "2026-10-21T10:00:02+00:00", "2026-10-21T10:00:02+00:00", False)], [A, B]),
+        _run("2026-10-21T11:00:00+00:00", [
+            _read(A, 1, "2026-10-21T11:00:01+00:00", "2026-10-21T11:00:01+00:00", True),
+            _read(b2, 1, "2026-10-21T11:00:02+00:00", "2026-10-21T11:00:02+00:00", False)], [A, b2]),
+    ]
+    rows = _by_pair(reconcile.shared_failures(runs))
+    assert (rows[(A, B)]["eligible_n"], rows[(A, B)]["failed_together_n"]) == (1, 1)
+    assert (rows[(A, b2)]["eligible_n"], rows[(A, b2)]["one_failed_n"]) == (1, 1)
+    assert rows[(b2, B)]["verdict"] == "unmeasured", "the old and the new peer were never asked together"
+
+
+def test_splitting_by_arrival_time_moves_the_counts_so_the_declared_window_is_what_is_read():
+    """minia2auk, satroot#2 (2 Nov): split one stored set of reads twice, by the window each read
+    declared and deliberately by arrival time; the counts must differ, or the fixture cannot tell
+    the rule from its absence."""
+    runs = [
+        _run("2026-10-21T23:59:50+00:00", [
+            _read(A, 1, "2026-10-21T23:59:55+00:00", "2026-10-21T23:59:56+00:00", True),
+            # asked before midnight, answered after it: a slow failure
+            _read(B, 1, "2026-10-21T23:59:58+00:00", "2026-10-22T00:00:03+00:00", False)], [A, B]),
+        _run("2026-10-22T00:15:00+00:00", [
+            _read(A, 1, "2026-10-22T00:15:01+00:00", "2026-10-22T00:15:01+00:00", False),
+            _read(B, 1, "2026-10-22T00:15:02+00:00", "2026-10-22T00:15:02+00:00", False)], [A, B]),
+    ]
+
+    def by_arrival(read):
+        return reconcile.declared_window(datetime.fromisoformat(read["answered_at"]))
+
+    def counts(rows):
+        return sorted((r["window"]["start"], tuple(r["pair"]), r["eligible_n"], r["failed_together_n"],
+                       r["one_failed_n"]) for r in rows)
+    declared = counts(reconcile.shared_failures(runs))
+    arrival = counts(reconcile.shared_failures(runs, window_of=by_arrival))
+    assert declared == [("2026-10-21T00:00:00+00:00", (A, B), 1, 0, 1),
+                        ("2026-10-22T00:00:00+00:00", (A, B), 1, 1, 0)], declared
+    assert arrival != declared, "the window rule moves the counts; the fixture can see it"
+
+
+def test_a_run_stores_its_reads_and_the_grouping_prints_them(monkeypatch, tmp_path, capsys):
+    fit = {"host": "primary.example", "network": NET, "finalized_height": 1000, "finalized_hash": "0xa10",
+           "depth_blocks": 600, "depth_s": 1200, "safe_depth_blocks": 50, "smell": False, "reason": "", "history": ""}
+
+    def fitness(net, url, records, when, floor, finality_fn=None):
+        finality_fn(url)
+        return dict(fit)
+
+    def cross(f, peers, finality_fn=None, **k):
+        for peer in peers:
+            finality_fn(peer)
+        return {"line": "cross-check: ok", "smell": False}
+    answers = {"https://primary.example/v2/KEYSECRET": {"finalized": (1000, "0xa10")},
+               "https://drpc.example/base": {"finalized": (1000, "0xa10")}, "https://base.example/rpc": {}}
+    monkeypatch.setattr(reconcile, "endpoint_finality", lambda url: answers[url])
+    monkeypatch.setattr(reconcile, "endpoint_fitness", fitness)
+    monkeypatch.setattr(reconcile, "endpoint_crosscheck", cross)
+    monkeypatch.setattr(reconcile, "RPC", {NET: "https://primary.example/v2/KEYSECRET"})
+    monkeypatch.delenv("SATLEDGER_RECONCILE_RPC", raising=False)
+    monkeypatch.setenv("SATLEDGER_FINALITY_SAMPLE", "%s=https://drpc.example/base|https://base.example/rpc" % NET)
+    monkeypatch.setattr(reconcile, "reconcile", lambda *a, **k: ([], 0))
+    log = tmp_path / "funnel.jsonl"
+    log.write_text(_line("settled", "0x" + "c2" * 32, "2026-10-21T10:00:00+00:00", tx="0xfac") + "\n")
+    history = tmp_path / "history.jsonl"
+    reconcile.main(["reconcile.py", str(log), "--now=2026-10-21T12:00:00Z", "--history=%s" % history])
+    stored = history.read_text()
+    assert "KEYSECRET" not in stored
+    probe = json.loads(stored.splitlines()[-1])["finality_reads"]
+    assert len(probe["configured"][NET]) == 3 and [r["ok"] for r in probe["reads"]] == [True, True, False]
+    capsys.readouterr()
+    assert reconcile.main(["reconcile.py", "--shared-failures", "--history=%s" % history]) == 0
+    rows = [json.loads(l) for l in capsys.readouterr().out.splitlines()]
+    assert len(rows) == 3 and {r["eligible_n"] for r in rows} == {1}
+    assert sorted(r["one_failed_n"] for r in rows) == [0, 1, 1]
+
+
+def test_the_grouping_needs_the_history_it_reads():
+    assert reconcile.main(["reconcile.py", "--shared-failures"]) == 2

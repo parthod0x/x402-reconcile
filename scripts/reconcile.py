@@ -212,26 +212,33 @@ s3.amazonaws.com) split their tenants instead of merging them; a host no rule
 covers is `unknown-suffix` and keeps its whole name, never a guessed merge
 key. Each hint carries its basis (host, suffix, rule, list version) on the
 row. The hint is co-tenancy of a name, not a failure domain: an anycast name
-spans nodes that fail apart. No shared-failure grouping is computed. One that
-is must count per pair and per window the reads where both were eligible and
-one was asked, the reads where both failed, and the reads where one did -
-(eligible_n, failed_together_n, one_failed_n) - with the window stored on the
-row, as a read stores its from_block, to_block and head, so two consumers
-regrouping the same rows reach the same verdict. It leaves a pair it cannot
-separate `unknown`, never `independent`: two peers each asked twice look
-perfectly correlated, and absence of correlation, like a different hint, is
-not evidence of separation. A pair with eligible_n 0 is `unmeasured`, and a
-pair with no row is not a pair with zeros: a consumer that reads the absence
-as a count gets a cleaner story than the data holds. So the output carries,
-per pair and window: the three counts and the window's bounds, never only a
-derived ratio, which a consumer cannot split differently; the window the read
-declared when it was issued, not when its answer arrived or its row was
-written, which a late re-read would move; endpoints as the pair's identity,
-not their operator hint, so a peer replaced mid-window is a second pair, not
-a silent merge of two populations under one key; and every `unmeasured` pair
-as a row of its own, or the state exists in this text and in no output. Its
-first test splits one stored set of rows twice, by the window each read
-declared and deliberately by arrival time, and requires the counts to
+spans nodes that fail apart. Which endpoints fail together is measured
+instead, from run history (--shared-failures). Every finality read a run
+makes is stored with its endpoint, the window it declared when it was asked
+(the UTC day), when its answer arrived, and whether it gave a `finalized`
+block; the n-th time a run asks an endpoint is that endpoint's pass n. Per
+pair of endpoints on a network and per window, the grouping counts the passes
+in which both were asked (eligible_n), the passes in which both failed
+(failed_together_n) and those in which exactly one did (one_failed_n), with
+the window stored on the row, as a read stores its from_block, to_block and
+head, so two consumers regrouping the same rows reach the same verdict. A
+pair it cannot separate is `unknown`, never `independent`: two peers each
+asked twice look perfectly correlated, and absence of correlation, like a
+different hint, is not evidence of separation. It separates none, so every
+measured pair is `unknown` and the counts are the finding. A pair with
+eligible_n 0 is `unmeasured`, and a pair with no row is not a pair with
+zeros: a consumer that reads the absence as a count gets a cleaner story than
+the data holds. So the output carries, per pair and window: the three counts
+and the window's bounds, never only a derived ratio, which a consumer cannot
+split differently; the window the read declared when it was issued, not when
+its answer arrived or its row was written, which a late re-read would move;
+endpoints as the pair's identity, not their operator hint - the host plus a
+digest of the whole URL, so a peer replaced mid-window is a second pair, not
+a silent merge of two populations under one key, and a key in a URL is never
+written down; and every configured pair never asked together as an
+`unmeasured` row of its own, or the state exists in this text and in no
+output. Its test splits one stored set of reads twice, by the window each
+read declared and deliberately by arrival time, and requires the counts to
 differ: a fixture that gives the same numbers both ways cannot tell the rule
 from its absence, and passes whether or not the window is read. Re-reading the anchor from its own
 endpoint was rejected: that is self-consistency, which a liar with a
@@ -386,6 +393,7 @@ are counted and skipped rather than guessed at.
 Usage:
     python scripts/reconcile.py funnel.jsonl
     python scripts/reconcile.py funnel.jsonl --now=2026-11-01T00:00:00Z --pay-to=0x...
+    python scripts/reconcile.py --shared-failures --history=reconcile-history.jsonl
 
 pay_to defaults to SATLEDGER_X402_PAY_TO (set in the api container). Without
 it the Transfer is not matched and a consumed slot is reported as "charged".
@@ -2124,6 +2132,100 @@ def apply_history(rows: List[Dict[str, Any]], records: List[Dict[str, Any]], at:
     return record
 
 
+#: The window a finality read is counted in: the UTC day it was asked in.
+SHARED_WINDOW_SECONDS = 24 * 3600
+
+
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def endpoint_id(url: str) -> str:
+    """An endpoint's identity on a stored row: its host and a digest of the
+    whole URL, so two paths on one host stay two endpoints, a replaced URL is
+    a new endpoint, and a key carried in the URL is never written down."""
+    import hashlib
+    return "%s#%s" % (_host(url), hashlib.sha256(url.encode("utf-8")).hexdigest()[:12])
+
+
+def declared_window(asked: datetime) -> Dict[str, str]:
+    """The window a read declares when it is issued: the UTC day of `asked`."""
+    start = int(asked.timestamp()) // SHARED_WINDOW_SECONDS * SHARED_WINDOW_SECONDS
+    return {"start": _iso(datetime.fromtimestamp(start, timezone.utc)),
+            "end": _iso(datetime.fromtimestamp(start + SHARED_WINDOW_SECONDS, timezone.utc))}
+
+
+class FinalityReads:
+    """Every finality read one run makes, kept for the shared-failure grouping."""
+
+    def __init__(self, clock=None):
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.reads: List[Dict[str, Any]] = []
+        self.configured: Dict[str, List[str]] = {}
+        self._passes: Dict[str, int] = {}
+
+    def configure(self, network: str, urls: List[str]) -> None:
+        self.configured[network] = sorted({endpoint_id(u) for u in urls})
+
+    def wrap(self, network: str, finality_fn=None):
+        finality_fn = finality_fn or endpoint_finality
+
+        def read(url: str):
+            asked, heads = self.clock(), None
+            try:
+                heads = finality_fn(url)
+            finally:
+                ident = endpoint_id(url)
+                self._passes[ident] = self._passes.get(ident, 0) + 1
+                self.reads.append({"network": network, "endpoint": ident, "pass": self._passes[ident],
+                                   "asked_at": _iso(asked), "answered_at": _iso(self.clock()),
+                                   "window": declared_window(asked),
+                                   "ok": bool((heads or {}).get("finalized"))})
+            return heads
+        return read
+
+    def record(self, run_started: datetime) -> Dict[str, Any]:
+        return {"window": declared_window(run_started), "configured": self.configured, "reads": self.reads}
+
+
+def shared_failures(records: List[Dict[str, Any]], window_of=None) -> List[Dict[str, Any]]:
+    """Per pair of endpoints and window, from stored runs; see the module docstring.
+
+    `window_of(read)` picks the window a read is counted in, by default the
+    one it declared when it was asked. It is a parameter so a test can split
+    the same reads another way and show the counts move."""
+    from itertools import combinations
+    window_of = window_of or (lambda read: read["window"])
+    passes: Dict[Tuple[str, str, str], Dict[Tuple[Any, int], Dict[str, bool]]] = {}
+    configured: Dict[Tuple[str, str, str], set] = {}
+    for rec in records:
+        probe = rec.get("finality_reads") or {}
+        for network, ids in (probe.get("configured") or {}).items():
+            run_window = probe.get("window") or {}
+            if run_window:
+                configured.setdefault((network, run_window["start"], run_window["end"]), set()).update(ids)
+        for read in probe.get("reads") or []:
+            window = window_of(read)
+            key = (read["network"], window["start"], window["end"])
+            configured.setdefault(key, set()).add(read["endpoint"])
+            passes.setdefault(key, {}).setdefault((rec.get("at"), read["pass"]), {})[read["endpoint"]] = read["ok"]
+    rows = []
+    for key in sorted(configured):
+        network, start, end = key
+        for a, b in combinations(sorted(configured[key]), 2):
+            eligible = together = one = 0
+            for answers in passes.get(key, {}).values():
+                if a in answers and b in answers:
+                    eligible += 1
+                    failed = (not answers[a]) + (not answers[b])
+                    together += failed == 2
+                    one += failed == 1
+            rows.append({"network": network, "window": {"start": start, "end": end}, "pair": [a, b],
+                         "eligible_n": eligible, "failed_together_n": together, "one_failed_n": one,
+                         "verdict": "unmeasured" if eligible == 0 else "unknown"})
+    return rows
+
+
 def unmeasured_cause(row: Dict[str, Any]) -> Optional[str]:
     """Why the reader did not see what this row needed, or None if it did."""
     if row["state"] == "unsupported-rpc":
@@ -2312,6 +2414,18 @@ def main(argv: List[str]) -> int:
             history = flag.split("=", 1)[1]
         if flag.startswith("--receivers="):
             receivers = [r.strip() for r in flag.split("=", 1)[1].split(",") if r.strip()]
+    if "--shared-failures" in argv[1:]:
+        if not history:
+            print("--shared-failures reads run history: give --history=FILE")
+            return 2
+        try:
+            with open(history, encoding="utf-8") as handle:
+                stored = [json.loads(l) for l in handle if l.strip()]
+        except FileNotFoundError:
+            stored = []
+        for row in shared_failures(stored):
+            print(json.dumps(row, sort_keys=True))
+        return 0
     if not args:
         print(__doc__)
         return 2
@@ -2333,7 +2447,9 @@ def main(argv: List[str]) -> int:
         if net and blocks:
             floors[net] = int(blocks)          # blocks, not seconds: no clock in the verdict
     networks = sorted({rec.get("network") for rec in parse_lines(lines)[0] if rec.get("network")})
-    fitness = [endpoint_fitness(net, RPC[net], records, when, floors.get(net)) for net in networks if RPC.get(net)]
+    probe = FinalityReads(clock=(lambda: when) if now else None)
+    fitness = [endpoint_fitness(net, RPC[net], records, when, floors.get(net), finality_fn=probe.wrap(net))
+               for net in networks if RPC.get(net)]
     samples: Dict[str, List[str]] = {}
     for pair in (os.environ.get("SATLEDGER_FINALITY_SAMPLE") or "").split(","):
         net, _, urls = pair.strip().partition("=")
@@ -2341,10 +2457,11 @@ def main(argv: List[str]) -> int:
             samples[net] = [u.strip() for u in urls.split("|") if u.strip()]
     for f in fitness:
         peers = [u for u in samples.get(f["network"], []) if _host(u) != f["host"]]
+        probe.configure(f["network"], [RPC[f["network"]]] + peers)
         if f["smell"] or not peers:
             f["cross"] = "" if f["smell"] else "single endpoint: a clamp just below an honest safe is not checkable"
             continue
-        cross = endpoint_crosscheck(f, peers, primary_url=RPC[f["network"]])
+        cross = endpoint_crosscheck(f, peers, primary_url=RPC[f["network"]], finality_fn=probe.wrap(f["network"]))
         f["cross"], f["witness"], f["no_witness"] = cross["line"], cross.get("witness"), cross.get("no_witness")
         if cross["smell"]:
             f["smell"], f["reason"] = True, cross["line"]
@@ -2368,6 +2485,7 @@ def main(argv: List[str]) -> int:
                                            "finalized_height": f["finalized_height"], "smell": f["smell"],
                                            "witness": f.get("witness"), "no_witness": f.get("no_witness") or []}
                                for f in fitness}
+        record["finality_reads"] = probe.record(when)
         with open(history, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
         stale = sum(1 for r in rows if r.get("stale"))

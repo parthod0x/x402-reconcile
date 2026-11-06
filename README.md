@@ -26,6 +26,7 @@ A log of JSON lines, one per settlement event. An optional `x402-funnel ` prefix
 ```
 python scripts/reconcile.py funnel.jsonl --pay-to=0xYourPayTo
 python scripts/reconcile.py funnel.jsonl --pay-to=0x… --history=reconcile-history.jsonl --rpc=eip155:8453=https://…
+python scripts/reconcile.py --shared-failures --history=reconcile-history.jsonl
 ```
 
 The settings come from the environment. The names carry satledger's prefix, because this is the production file unchanged.
@@ -71,6 +72,8 @@ The possible states:
 `final` means the evidence block is at or below the endpoint's L1-finalized head and carries that chain's hash at that height. A run that could measure nothing says `blind`, not `clean`.
 
 Peer endpoints' `finalized` claims are compared by hash before height. Two finalized blocks at one height, or a lower claim that is not on the highest claimant's chain, is reported as `undetermined` with the height and both hashes, and that network's rows are not judged. The highest claim anchors the others, so it is first witnessed by a second endpoint reporting the same block at that height, asked only if its own `safe` head has reached that height. An anchor nobody else can confirm is stated on the line as unwitnessed, saying whether no endpoint had reached the height or which eligible ones gave no block, and whether each errored or answered without one. The witness is named on every verdict line, in the result and in the history record, and each side of a contradiction carries its role. Every height comparison assumes the chain never finalizes two blocks at one height, so that assumption is checked, not inherited.
+
+With `--history`, every finality read a run makes is stored: the endpoint (its host and a digest of the URL, never the URL), the UTC day it was asked in, when the answer arrived, and whether it gave a `finalized` block. `--shared-failures` reads that history and prints one JSON row per pair of endpoints and day: the passes in which both were asked (`eligible_n`), in which both failed (`failed_together_n`) and in which exactly one did (`one_failed_n`). A pair never asked together is a row marked `unmeasured`, not a missing row. Every measured pair is `unknown`: the counts are the finding, and no pair is called independent.
 
 Exit codes:
 
